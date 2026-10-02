@@ -27,6 +27,10 @@ wheelhouse/
 *.log
 logs/
 
+# Local motor manuals and reference files
+/references/
+/motor-firmware-master/
+
 # Editor and operating-system files
 .vscode/
 .idea/
