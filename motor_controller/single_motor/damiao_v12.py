@@ -118,6 +118,10 @@ class MoveCancelledError(RuntimeError):
     """Raised when a user stops an active motor move."""
 
 
+class ConnectionCancelledError(RuntimeError):
+    """Raised when a user cancels a CAN connection or register read."""
+
+
 class DamiaoMotor:
     def __init__(self, bus: can.BusABC, can_id: int, master_id: int) -> None:
         if not 0 <= can_id < 16:
@@ -144,7 +148,15 @@ class DamiaoMotor:
         )
         self.bus.send(message)
 
-    def read_register(self, register: int, timeout_s: float = 1.0) -> int | float:
+    def read_register(
+        self,
+        register: int,
+        timeout_s: float = 1.0,
+        cancel_event: threading.Event | None = None,
+    ) -> int | float:
+        if cancel_event is not None and cancel_event.is_set():
+            raise ConnectionCancelledError("CAN connection cancelled by user.")
+
         request = bytes(
             (
                 self.can_id & 0xFF,
@@ -161,7 +173,10 @@ class DamiaoMotor:
 
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
-            message = self.bus.recv(timeout=max(0.0, deadline - time.monotonic()))
+            if cancel_event is not None and cancel_event.is_set():
+                raise ConnectionCancelledError("CAN connection cancelled by user.")
+            remaining = max(0.0, deadline - time.monotonic())
+            message = self.bus.recv(timeout=min(0.1, remaining))
             if message is None or message.arbitration_id != self.master_id:
                 continue
             if len(message.data) != 8:
@@ -190,15 +205,18 @@ class DamiaoMotor:
             for address, name, unit in PRESENT_PARAMETER_REGISTERS
         ]
 
-    def verify_configuration(self) -> MotorSettings:
-        actual_can_id = int(self.read_register(REGISTER_CAN_ID))
-        actual_master_id = int(self.read_register(REGISTER_MASTER_ID))
-        actual_mode = int(self.read_register(REGISTER_CONTROL_MODE))
-        position_range = float(self.read_register(REGISTER_POSITION_RANGE))
-        velocity_range = float(self.read_register(REGISTER_VELOCITY_RANGE))
-        torque_range = float(self.read_register(REGISTER_TORQUE_RANGE))
-        firmware_version = int(self.read_register(REGISTER_FIRMWARE_VERSION))
-        sub_version = int(self.read_register(REGISTER_SUB_VERSION))
+    def verify_configuration(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> MotorSettings:
+        actual_can_id = int(self.read_register(REGISTER_CAN_ID, cancel_event=cancel_event))
+        actual_master_id = int(self.read_register(REGISTER_MASTER_ID, cancel_event=cancel_event))
+        actual_mode = int(self.read_register(REGISTER_CONTROL_MODE, cancel_event=cancel_event))
+        position_range = float(self.read_register(REGISTER_POSITION_RANGE, cancel_event=cancel_event))
+        velocity_range = float(self.read_register(REGISTER_VELOCITY_RANGE, cancel_event=cancel_event))
+        torque_range = float(self.read_register(REGISTER_TORQUE_RANGE, cancel_event=cancel_event))
+        firmware_version = int(self.read_register(REGISTER_FIRMWARE_VERSION, cancel_event=cancel_event))
+        sub_version = int(self.read_register(REGISTER_SUB_VERSION, cancel_event=cancel_event))
 
         if actual_can_id != self.can_id:
             raise RuntimeError(
@@ -376,6 +394,7 @@ class DamiaoMotor:
         cancel_event: threading.Event | None = None,
         progress_callback: Callable[[MotorFeedback], None] | None = None,
         enable_first: bool = True,
+        disable_on_cancel: bool = True,
     ) -> MotorFeedback:
         values = (
             position_rad,
@@ -420,20 +439,51 @@ class DamiaoMotor:
         interval_s = 1.0 / command_rate_hz
         deadline = time.monotonic() + timeout_s
         stable_samples = 0
+        command_position = feedback.position_rad
 
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
-                self.disable()
-                raise MoveCancelledError("Move stopped; motor disabled and active torque removed.")
+                if disable_on_cancel:
+                    self.disable()
+                    raise MoveCancelledError(
+                        "Move stopped; motor disabled and active torque removed."
+                    )
+                hold_feedback = self.last_feedback or feedback
+                hold_position = hold_feedback.position_rad
+                hold_velocity = (
+                    0.0
+                    if self.control_mode == CONTROL_MODE_MIT
+                    else max_velocity_rad_s
+                )
+                hold_id, hold_command = self.encode_position_command(
+                    hold_position, hold_velocity, kp, kd
+                )
+                self._send(hold_id, hold_command)
+                raise MoveCancelledError(
+                    "Target send released; motor remains enabled at its current position."
+                )
 
             cycle_started = time.monotonic()
+            if self.control_mode == CONTROL_MODE_MIT:
+                remaining = position_rad - command_position
+                max_step = max_velocity_rad_s * interval_s
+                if abs(remaining) <= max_step:
+                    command_position = position_rad
+                    command_velocity = remaining / interval_s
+                else:
+                    command_velocity = math.copysign(max_velocity_rad_s, remaining)
+                    command_position += command_velocity * interval_s
+                arbitration_id, command = self.encode_position_command(
+                    command_position, command_velocity, kp, kd
+                )
             self._send(arbitration_id, command)
             feedback = self._read_feedback(timeout_s=interval_s)
             if feedback is not None:
                 if feedback.status != 1:
                     self.enabled = False
                     raise RuntimeError(
-                        f"Motor left Enable Mode or reported fault status {feedback.status}."
+                        f"Drive reported status {feedback.status}; motor is no longer in Enable Mode. "
+                        "Check the controller fault state before enabling again."
                     )
 
                 position_error = abs(position_rad - feedback.position_rad)

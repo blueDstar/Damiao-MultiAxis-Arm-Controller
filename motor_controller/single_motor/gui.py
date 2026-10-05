@@ -6,7 +6,9 @@ import math
 import os
 import queue
 import threading
+import time
 import tkinter as tk
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -15,13 +17,15 @@ from dotenv import load_dotenv
 from serial.tools import list_ports
 
 from single_motor.damiao_v12 import (
+    ConnectionCancelledError,
     DamiaoMotor,
     MoveCancelledError,
     MotorFeedback,
     MotorSettings,
     PresentParameter,
 )
-from single_motor.move_to_angle import validate_slcan_port
+from single_motor.move_to_angle import validate_usb2can_port
+from single_motor.usb2can_serial import DamiaoUSB2CANBus, USB2CAN_CAN_BAUDS_KBPS
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -38,6 +42,17 @@ def env_float(name: str, default: float) -> float:
     return float(value) if value else default
 
 
+@dataclass(frozen=True)
+class SavedTarget:
+    relative_angle_rad: float
+    position_rad: float
+    speed_rad_s: float
+    kp: float
+    kd: float
+    arbitration_id: int
+    payload: bytes
+
+
 class MotorControlApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
@@ -47,33 +62,49 @@ class MotorControlApp:
 
         self.events: queue.Queue[tuple[str, object]] = queue.Queue()
         self.cancel_event = threading.Event()
+        self.connection_cancel_event = threading.Event()
         self.worker: threading.Thread | None = None
         self.bus: can.BusABC | None = None
         self.motor: DamiaoMotor | None = None
         self.settings: MotorSettings | None = None
         self.busy = False
+        self.current_task: str | None = None
         self.motor_enabled = False
+        self.disable_after_cancel = False
         self.closing = False
+        self.jog_thread: threading.Thread | None = None
+        self.jog_stop_event: threading.Event | None = None
+        self.jog_direction = 0
+        self.jog_target_position = 0.0
+        self.jog_reference_position = 0.0
+        self.jog_speed_limit = 0.0
+        self.zero_offset_rad = 0.0
+        self.active_control_panel = "target"
+        self.saved_target: SavedTarget | None = None
         self.port_descriptions: dict[str, str] = {}
 
         self.channel_var = tk.StringVar(value=os.getenv("DAMIAO_CAN_CHANNEL", "COM3"))
         self.can_bitrate_var = tk.StringVar(value=str(env_int("DAMIAO_CAN_BITRATE", 1_000_000)))
         self.serial_baud_var = tk.StringVar(
-            value=str(env_int("DAMIAO_CAN_SERIAL_BAUDRATE", 115_200))
+            value=str(env_int("DAMIAO_CAN_SERIAL_BAUDRATE", 921_600))
         )
-        self.can_id_var = tk.StringVar(value=f"0x{env_int('DAMIAO_CAN_ID', 0x01):02X}")
-        self.master_id_var = tk.StringVar(value=f"0x{env_int('DAMIAO_MASTER_ID', 0x11):02X}")
+        self.can_id_var = tk.StringVar(value=f"0x{env_int('DAMIAO_CAN_ID', 0x02):02X}")
+        self.master_id_var = tk.StringVar(value=f"0x{env_int('DAMIAO_MASTER_ID', 0x12):02X}")
         self.angle_var = tk.StringVar(value="0")
+        self.control_panel_var = tk.StringVar(value="target")
         self.angle_unit_var = tk.StringVar(value="rad")
         self.speed_var = tk.StringVar(value="0.2")
         self.speed_unit_var = tk.StringVar(value="rad/s")
+        self.jog_speed_var = tk.StringVar(value=str(env_float("DAMIAO_JOG_SPEED_RAD_S", 15.0)))
         self.kp_var = tk.StringVar(value="2.0")
         self.kd_var = tk.StringVar(value="1.0")
         self.status_var = tk.StringVar(value="Chưa kết nối")
+        self.connection_state_var = tk.StringVar(value="CAN DISCONNECTED")
         self.driver_info_var = tk.StringVar(value="Chưa đọc thông tin driver")
         self.feedback_var = tk.StringVar(value="Vị trí: -- rad    Tốc độ: -- rad/s")
         self.motor_state_var = tk.StringVar(value="MOTOR DISABLED")
         self.hex_preview_var = tk.StringVar(value="Read driver mode to preview the CAN frame.")
+        self.zero_status_var = tk.StringVar(value="Zero offset: 0.000 rad (not saved)")
 
         self._configure_style()
         self._build_widgets()
@@ -85,17 +116,40 @@ class MotorControlApp:
         style = ttk.Style(self.root)
         if "clam" in style.theme_names():
             style.theme_use("clam")
-        self.root.configure(bg="#f2f4f1")
-        style.configure("TFrame", background="#f2f4f1")
-        style.configure("TLabel", background="#f2f4f1", foreground="#202923")
-        style.configure("Title.TLabel", font=("Segoe UI", 18, "bold"), foreground="#183b34")
-        style.configure("Hint.TLabel", foreground="#58655e")
-        style.configure("TLabelFrame", background="#f2f4f1", foreground="#183b34")
-        style.configure("TLabelFrame.Label", font=("Segoe UI", 10, "bold"))
-        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8))
-        style.configure("Danger.TButton", foreground="#8f2d25", padding=(12, 8))
-        style.configure("MotorOff.TLabel", background="#9d3328", foreground="#ffffff", padding=(8, 4))
-        style.configure("MotorOn.TLabel", background="#187448", foreground="#ffffff", padding=(8, 4))
+
+        bg = "#020817"
+        bg_panel = "#0b1327"
+        bg_card = "#101a2d"
+        accent = "#38bdf8"
+        accent2 = "#7dd3fc"
+        text = "#e2e8f0"
+        muted = "#93c5fd"
+        green = "#22c55e"
+        red = "#ef4444"
+        amber = "#f59e0b"
+
+        self.root.configure(bg=bg)
+        style.configure("TFrame", background=bg)
+        style.configure("TLabel", background=bg, foreground=text)
+        style.configure("Title.TLabel", font=("Segoe UI", 22, "bold"), foreground=accent2)
+        style.configure("Hint.TLabel", foreground=muted)
+        style.configure("TLabelFrame", background=bg, foreground=accent2)
+        style.configure("TLabelFrame.Label", font=("Segoe UI", 10, "bold"), foreground=accent2)
+        style.configure("TEntry", fieldbackground=bg_card, foreground=text)
+        style.configure("TCombobox", fieldbackground=bg_card, foreground=text)
+        style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8), background=accent, foreground="#03131d")
+        style.map(
+            "Primary.TButton",
+            background=[("active", accent2), ("pressed", "#0ea5e9")],
+            foreground=[("active", "#03131d"), ("pressed", "#03131d")],
+        )
+        style.configure("Danger.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 8), background=red, foreground="#ffffff")
+        style.map("Danger.TButton", background=[("active", "#f87171"), ("pressed", "#dc2626")])
+        style.configure("MotorOff.TLabel", background="#4b5563", foreground="#ffffff", padding=(8, 4))
+        style.configure("MotorOn.TLabel", background=green, foreground="#04110b", padding=(8, 4))
+        style.configure("Connecting.TLabel", background=amber, foreground="#0b1014", padding=(8, 4))
+        style.configure("Jog.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 10), background=bg_panel, foreground=accent2)
+        style.map("Jog.TButton", background=[("active", "#0f172a"), ("pressed", "#0b1327")], foreground=[("active", accent2), ("pressed", accent2)])
 
     def _build_widgets(self) -> None:
         container = ttk.Frame(self.root, padding=20)
@@ -137,7 +191,7 @@ class MotorControlApp:
         ttk.Entry(connection, textvariable=self.serial_baud_var, width=14).grid(
             row=1, column=1, sticky="w", pady=4
         )
-        ttk.Label(connection, text="SLCAN-compatible USB2CAN", style="Hint.TLabel").grid(
+        ttk.Label(connection, text="Vendor USB2CAN serial adapter", style="Hint.TLabel").grid(
             row=1, column=2, columnspan=3, sticky="e", pady=4
         )
 
@@ -154,19 +208,52 @@ class MotorControlApp:
             row=0, column=3, sticky="ew"
         )
 
+        connect_actions = ttk.Frame(ids)
+        connect_actions.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(12, 4))
+        connect_actions.columnconfigure(0, weight=1)
+        connect_actions.columnconfigure(1, weight=1)
         self.apply_button = ttk.Button(
-            ids,
-            text="Apply & read driver",
+            connect_actions,
+            text="Connect",
             style="Primary.TButton",
             command=self.apply_connection,
         )
-        self.apply_button.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(12, 4))
+        self.apply_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
+        self.cancel_connection_button = ttk.Button(
+            connect_actions,
+            text="Cancel",
+            command=self.cancel_connection,
+            state="disabled",
+        )
+        self.cancel_connection_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
         ttk.Label(ids, textvariable=self.driver_info_var, style="Hint.TLabel").grid(
             row=2, column=0, columnspan=4, sticky="w", pady=(4, 0)
         )
+        self.connection_state_label = ttk.Label(
+            ids, textvariable=self.connection_state_var, style="MotorOff.TLabel"
+        )
+        self.connection_state_label.grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
+
+        modes = ttk.Frame(container)
+        modes.grid(row=4, column=0, sticky="w", pady=(0, 8))
+        ttk.Radiobutton(
+            modes,
+            text="Position target",
+            value="target",
+            variable=self.control_panel_var,
+            command=self._change_control_panel,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Radiobutton(
+            modes,
+            text="Manual jog",
+            value="manual",
+            variable=self.control_panel_var,
+            command=self._change_control_panel,
+        ).pack(side="left")
 
         target = ttk.LabelFrame(container, text="Position target", padding=12)
-        target.grid(row=4, column=0, sticky="ew", pady=(0, 10))
+        self.target_panel = target
+        target.grid(row=5, column=0, sticky="ew", pady=(0, 10))
         target.columnconfigure(1, weight=1)
         target.columnconfigure(4, weight=1)
 
@@ -213,12 +300,21 @@ class MotorControlApp:
             style="Hint.TLabel",
             wraplength=760,
         ).grid(row=3, column=0, columnspan=6, sticky="w", pady=(8, 0))
+        self.save_zero_button = ttk.Button(
+            target,
+            text="Save current position as zero",
+            command=self.save_zero,
+            state="disabled",
+        )
+        self.save_zero_button.grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(target, textvariable=self.zero_status_var, style="Hint.TLabel").grid(
+            row=4, column=2, columnspan=4, sticky="w", padx=(10, 0), pady=(8, 0)
+        )
 
         actions = ttk.Frame(container)
-        actions.grid(row=5, column=0, sticky="ew", pady=(0, 10))
-        actions.columnconfigure(0, weight=1)
-        actions.columnconfigure(1, weight=1)
-        actions.columnconfigure(2, weight=1)
+        actions.grid(row=6, column=0, sticky="ew", pady=(0, 10))
+        for column in range(4):
+            actions.columnconfigure(column, weight=1)
         self.enter_button = ttk.Button(
             actions,
             text="Enter Motor",
@@ -229,12 +325,21 @@ class MotorControlApp:
         self.enter_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
         self.send_button = ttk.Button(
             actions,
-            text="Send target",
+            text="Save target",
             style="Primary.TButton",
-            command=self.send_target,
+            command=self.save_target,
             state="disabled",
         )
         self.send_button.grid(row=0, column=1, sticky="ew", padx=6)
+        self.hold_send_button = ttk.Button(
+            actions,
+            text="Hold to send",
+            style="Jog.TButton",
+            state="disabled",
+        )
+        self.hold_send_button.grid(row=0, column=2, sticky="ew", padx=6)
+        self.hold_send_button.bind("<ButtonPress-1>", lambda _event: self.send_target())
+        self.hold_send_button.bind("<ButtonRelease-1>", lambda _event: self.release_target_send())
         self.stop_button = ttk.Button(
             actions,
             text="Stop / Disable",
@@ -242,15 +347,44 @@ class MotorControlApp:
             command=self.stop_motor,
             state="disabled",
         )
-        self.stop_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+        self.stop_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
+
+        jog = ttk.LabelFrame(container, text="Manual jog", padding=12)
+        self.jog_panel = jog
+        jog.grid(row=7, column=0, sticky="ew", pady=(0, 10))
+        jog.columnconfigure(0, weight=1)
+        jog.columnconfigure(1, weight=1)
+        ttk.Label(jog, text="Jog speed (rad/s)").grid(row=0, column=0, sticky="w", padx=(0, 8), pady=(0, 5))
+        ttk.Entry(jog, textvariable=self.jog_speed_var, width=12).grid(row=0, column=1, sticky="w", pady=(0, 5))
+
+        self.jog_left_button = ttk.Button(
+            jog,
+            text="◀ Jog left",
+            style="Jog.TButton",
+            state="disabled",
+        )
+        self.jog_left_button.grid(row=1, column=0, sticky="ew", padx=(0, 6), pady=(6, 0))
+        self.jog_left_button.bind("<ButtonPress-1>", lambda _event: self.start_jog(-1))
+        self.jog_left_button.bind("<ButtonRelease-1>", lambda _event: self.stop_jog())
+
+        self.jog_right_button = ttk.Button(
+            jog,
+            text="Jog right ▶",
+            style="Jog.TButton",
+            state="disabled",
+        )
+        self.jog_right_button.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
+        self.jog_right_button.bind("<ButtonPress-1>", lambda _event: self.start_jog(1))
+        self.jog_right_button.bind("<ButtonRelease-1>", lambda _event: self.stop_jog())
+        jog.grid_remove()
 
         self.motor_state_label = ttk.Label(
             container, textvariable=self.motor_state_var, style="MotorOff.TLabel"
         )
-        self.motor_state_label.grid(row=6, column=0, sticky="w", pady=(0, 8))
+        self.motor_state_label.grid(row=8, column=0, sticky="w", pady=(0, 8))
 
         parameters = ttk.LabelFrame(container, text="Present parameters", padding=10)
-        parameters.grid(row=7, column=0, sticky="nsew", pady=(0, 10))
+        parameters.grid(row=9, column=0, sticky="nsew", pady=(0, 10))
         parameters.columnconfigure(0, weight=1)
         parameters.rowconfigure(1, weight=1)
         self.parameter_button = ttk.Button(
@@ -286,10 +420,10 @@ class MotorControlApp:
         scrollbar.grid(row=0, column=1, sticky="ns")
 
         ttk.Label(container, textvariable=self.feedback_var, font=("Segoe UI", 11, "bold")).grid(
-            row=8, column=0, sticky="w", pady=(4, 8)
+            row=10, column=0, sticky="w", pady=(4, 8)
         )
         ttk.Label(container, textvariable=self.status_var, style="Hint.TLabel").grid(
-            row=9, column=0, sticky="w", pady=(0, 8)
+            row=11, column=0, sticky="w", pady=(0, 8)
         )
 
         self.log = tk.Text(
@@ -305,10 +439,10 @@ class MotorControlApp:
             font=("Consolas", 9),
             state="disabled",
         )
-        self.log.grid(row=10, column=0, sticky="nsew")
-        container.rowconfigure(7, weight=1)
-        container.rowconfigure(10, weight=1)
-        self._log("Set the IDs used by the driver, then Apply & read driver.")
+        self.log.grid(row=12, column=0, sticky="nsew")
+        container.rowconfigure(9, weight=1)
+        container.rowconfigure(12, weight=1)
+        self._log("Select COM and IDs, then Connect; use Cancel to abort a pending connection.")
         self._log("This interface does not write IDs or motor parameters to flash.")
         for variable in (
             self.angle_var,
@@ -357,18 +491,36 @@ class MotorControlApp:
         if self.busy:
             return
         self.busy = True
+        self.current_task = task_name
         self.apply_button.configure(state="disabled")
+        self.cancel_connection_button.configure(
+            state="normal" if task_name == "Connecting" else "disabled"
+        )
         self.enter_button.configure(state="disabled")
         self.send_button.configure(state="disabled")
         self.parameter_button.configure(state="disabled")
-        self.stop_button.configure(state="normal" if task_name == "Moving motor" else "disabled")
+        self.stop_button.configure(
+            state="normal" if task_name in ("Moving motor", "Sending target") else "disabled"
+        )
+        self._update_target_buttons()
         self.status_var.set(task_name)
 
         def run() -> None:
             try:
                 result = operation()  # type: ignore[operator]
+            except ConnectionCancelledError as exc:
+                self.events.put(("connection_cancelled", str(exc)))
             except MoveCancelledError as exc:
-                self.events.put(("cancelled", str(exc)))
+                force_disable = self.disable_after_cancel
+                if force_disable and self.motor is not None:
+                    self.motor.disable()
+                self.disable_after_cancel = False
+                message = (
+                    "Target stopped; motor disabled."
+                    if force_disable
+                    else str(exc)
+                )
+                self.events.put(("cancelled", message))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
             else:
@@ -381,11 +533,15 @@ class MotorControlApp:
         try:
             can_id, master_id = self._parse_ids()
             channel = self.channel_var.get().strip()
-            validate_slcan_port(channel)
+            validate_usb2can_port(channel)
             bitrate = int(self.can_bitrate_var.get().strip(), 0)
             serial_baudrate = int(self.serial_baud_var.get().strip(), 0)
             if bitrate <= 0 or serial_baudrate <= 0:
                 raise ValueError("CAN bitrate and adapter baud must be positive.")
+            try:
+                can_bitrate_code = USB2CAN_CAN_BAUDS_KBPS.index(bitrate // 1000)
+            except ValueError as exc:
+                raise ValueError(f"Unsupported Damiao USB2CAN CAN bitrate: {bitrate} bit/s.") from exc
         except (ValueError, RuntimeError) as exc:
             messagebox.showerror("Connection settings", str(exc), parent=self.root)
             return
@@ -411,35 +567,43 @@ class MotorControlApp:
             self.send_button.configure(state="disabled")
             self.stop_button.configure(state="disabled")
 
-        self._log(f"Connecting to {channel}; reading driver registers...")
+        self.connection_cancel_event.clear()
+        self.connection_state_var.set("CAN CONNECTING")
+        self.connection_state_label.configure(style="Connecting.TLabel")
+        self._log(f"Connecting to {channel}; checking CAN response...")
 
         def connect() -> tuple[can.BusABC, DamiaoMotor, MotorSettings]:
             if self.bus is not None:
                 self.bus.shutdown()
-            bus = can.Bus(
-                interface="slcan",
+            bus = DamiaoUSB2CANBus(
                 channel=channel,
-                bitrate=bitrate,
-                tty_baudrate=serial_baudrate,
+                baudrate=serial_baudrate,
+                can_bitrate_code=can_bitrate_code,
             )
             try:
                 motor = DamiaoMotor(bus, can_id=can_id, master_id=master_id)
-                settings = motor.verify_configuration()
+                settings = motor.verify_configuration(cancel_event=self.connection_cancel_event)
             except TimeoutError as exc:
                 bus.shutdown()
                 raise RuntimeError(
                     "COM port opened, but the motor did not answer the read-only CAN query. "
-                    "Check that this USB2CAN supports SLCAN, CAN bitrate is 1 Mbps, and the "
-                    "motor IDs match. No enable or movement command was sent. If Damiao "
-                    "Debugging Tool reads this same adapter, it may use a vendor USB2CAN "
-                    "driver/DLL instead of SLCAN."
+                    "Check that the USB2CAN adapter is connected to COM3, the UART is 921600, "
+                    "the CAN bitrate matches the device configuration, and the motor IDs match. "
+                    "No enable or movement command was sent."
                 ) from exc
             except Exception:
                 bus.shutdown()
                 raise
             return bus, motor, settings
 
-        self._start_worker("Applying connection", connect)
+        self._start_worker("Connecting", connect)
+
+    def cancel_connection(self) -> None:
+        if self.busy and self.current_task == "Connecting":
+            self.connection_cancel_event.set()
+            self.cancel_connection_button.configure(state="disabled")
+            self.status_var.set("Cancelling connection...")
+            self._log("Connection cancelled by user; no motor enable/move command sent.")
 
     def _target_values(self) -> tuple[float, float, float, float]:
         angle_value = float(self.angle_var.get().strip())
@@ -457,21 +621,311 @@ class MotorControlApp:
         )
         return angle_rad, speed_rad_s, kp, kd
 
+    def _motor_target_position(self, relative_angle_rad: float) -> float:
+        return self.zero_offset_rad + relative_angle_rad
+
+    def save_zero(self) -> None:
+        if self.busy:
+            self.status_var.set("Wait for the target operation to stop before saving zero")
+            return
+        feedback = self.motor.last_feedback if self.motor is not None else None
+        if not self.motor_enabled or feedback is None:
+            self.status_var.set("Enable the motor and wait for feedback before saving zero")
+            return
+        self.zero_offset_rad = feedback.position_rad
+        self.zero_status_var.set(f"Zero offset: {self.zero_offset_rad:.3f} rad")
+        if self.saved_target is not None:
+            previous_target = self.saved_target
+            try:
+                self.saved_target = self._build_saved_target(
+                    previous_target.relative_angle_rad,
+                    previous_target.speed_rad_s,
+                    previous_target.kp,
+                    previous_target.kd,
+                )
+            except ValueError as exc:
+                self.saved_target = None
+                self.status_var.set(f"Zero saved; prior target cleared: {exc}")
+            else:
+                self.status_var.set("Zero saved; saved target rebased from the current position")
+        else:
+            self.status_var.set("Current feedback position saved as software zero")
+        self._log(f"Saved software zero at motor position {self.zero_offset_rad:.3f} rad.")
+        self._update_target_buttons()
+        self._update_hex_preview()
+
+    def _change_control_panel(self) -> None:
+        requested = self.control_panel_var.get()
+        jog_active = self.jog_thread is not None and self.jog_thread.is_alive()
+        if self.busy or jog_active:
+            self.control_panel_var.set(self.active_control_panel)
+            self.status_var.set("Stop the active operation before switching control modes")
+            return
+        if requested not in ("target", "manual"):
+            self.control_panel_var.set(self.active_control_panel)
+            return
+
+        self.active_control_panel = requested
+        if requested == "manual":
+            self.angle_var.set("0")
+            self.saved_target = None
+            self.target_panel.grid_remove()
+            self.jog_panel.grid()
+            self.send_button.grid_remove()
+            self.hold_send_button.grid_remove()
+            self.stop_button.grid(row=0, column=1, sticky="ew", padx=6)
+        else:
+            self.jog_panel.grid_remove()
+            self.target_panel.grid()
+            self.send_button.grid(row=0, column=1, sticky="ew", padx=6)
+            self.hold_send_button.grid(row=0, column=2, sticky="ew", padx=6)
+            self.stop_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
+        self._set_jog_buttons(self.motor_enabled)
+        self._update_target_buttons()
+        self._update_hex_preview()
+
+    def _update_target_buttons(self) -> None:
+        target_mode = self.active_control_panel == "target"
+        can_save = target_mode and self.settings is not None and not self.busy
+        hold_in_progress = self.busy and self.current_task == "Sending target"
+        can_send = (
+            target_mode
+            and self.motor_enabled
+            and self.saved_target is not None
+            and (not self.busy or hold_in_progress)
+        )
+        self.send_button.configure(state="normal" if can_save else "disabled")
+        self.hold_send_button.configure(state="normal" if can_send else "disabled")
+
+    def _build_saved_target(
+        self,
+        relative_angle_rad: float,
+        speed_rad_s: float,
+        kp: float,
+        kd: float,
+    ) -> SavedTarget:
+        if self.motor is None or self.settings is None:
+            raise ValueError("Connect to the motor before saving a target.")
+        if not all(math.isfinite(value) for value in (relative_angle_rad, speed_rad_s, kp, kd)):
+            raise ValueError("Target angle, speed, Kp, and Kd must be finite numbers.")
+        if speed_rad_s <= 0:
+            raise ValueError("Speed must be greater than zero.")
+        safe_speed = env_float("DAMIAO_SAFE_MAX_SPEED_RAD_S", 30.0)
+        if speed_rad_s > min(safe_speed, self.settings.velocity_range_rad_s):
+            raise ValueError(
+                f"Speed must not exceed {min(safe_speed, self.settings.velocity_range_rad_s):g} rad/s."
+            )
+        position_rad = self._motor_target_position(relative_angle_rad)
+        if abs(position_rad) > self.settings.position_range_rad:
+            raise ValueError(
+                f"Target maps to motor position {position_rad:.3f} rad, outside the "
+                f"driver's PMAX range ±{self.settings.position_range_rad:g} rad."
+            )
+        frame_velocity = (
+            0.0 if self.settings.control_mode == 1 else speed_rad_s
+        )
+        arbitration_id, payload = self.motor.encode_position_command(
+            position_rad, frame_velocity, kp, kd
+        )
+        return SavedTarget(
+            relative_angle_rad=relative_angle_rad,
+            position_rad=position_rad,
+            speed_rad_s=speed_rad_s,
+            kp=kp,
+            kd=kd,
+            arbitration_id=arbitration_id,
+            payload=payload,
+        )
+
     def _update_hex_preview(self, *_args: str) -> None:
         if self.motor is None or self.settings is None:
             self.hex_preview_var.set("Apply & read driver to preview its active CAN mode.")
             return
         try:
             angle_rad, speed_rad_s, kp, kd = self._target_values()
+            motor_position_rad = self._motor_target_position(angle_rad)
             arbitration_id, payload = self.motor.encode_position_command(
-                angle_rad, speed_rad_s, kp, kd
+                motor_position_rad, speed_rad_s, kp, kd
             )
             self.hex_preview_var.set(
                 f"TX CAN ID 0x{arbitration_id:03X}  DATA {payload.hex(' ').upper()}  |  "
+                f"Target {angle_rad:.3f} rad from zero; motor {motor_position_rad:.3f} rad; "
                 f"Feedback Master 0x{self.settings.master_id:03X}"
             )
         except (ValueError, RuntimeError) as exc:
             self.hex_preview_var.set(f"Frame preview unavailable: {exc}")
+
+    def _set_jog_buttons(self, enabled: bool) -> None:
+        state = (
+            "normal"
+            if enabled and self.active_control_panel == "manual" and not self.busy
+            else "disabled"
+        )
+        if hasattr(self, "jog_left_button"):
+            self.jog_left_button.configure(state=state)
+        if hasattr(self, "jog_right_button"):
+            self.jog_right_button.configure(state=state)
+
+    def _jog_speed_value(self) -> float:
+        speed = float(self.jog_speed_var.get().strip())
+        if not math.isfinite(speed) or speed <= 0:
+            raise ValueError("Jog speed must be a positive value.")
+        max_speed = min(30.0, self.settings.velocity_range_rad_s if self.settings is not None else 30.0)
+        if speed > max_speed:
+            raise ValueError(f"Jog speed must not exceed {max_speed:g} rad/s.")
+        return speed
+
+    def _send_jog_velocity(self, velocity_rad_s: float, delta_s: float) -> bool:
+        if self.motor is None:
+            return False
+        try:
+            kp_var = getattr(self, "kp_var", None)
+            kd_var = getattr(self, "kd_var", None)
+            kp = float((kp_var.get() if kp_var is not None else "2.0").strip())
+            kd = float((kd_var.get() if kd_var is not None else "1.0").strip())
+            limit_reached = False
+            if self.settings.control_mode == 1:
+                position_rad = self.jog_reference_position
+                command_velocity = velocity_rad_s
+                command_kp = 0.0
+            elif self.settings.control_mode == 2:
+                requested_position = self.jog_target_position + velocity_rad_s * delta_s
+                position_limit = self.settings.position_range_rad
+                position_rad = max(
+                    -position_limit,
+                    min(position_limit, requested_position),
+                )
+                limit_reached = position_rad != requested_position
+                command_velocity = self.jog_speed_limit
+                command_kp = kp
+            else:
+                raise RuntimeError(
+                    f"Jog is not supported in control mode {self.settings.control_mode}."
+                )
+            arbitration_id, payload = self.motor.encode_position_command(
+                position_rad,
+                command_velocity,
+                command_kp,
+                kd,
+            )
+            self.motor._send(arbitration_id, payload)
+            if self.settings.control_mode == 2:
+                self.jog_target_position = position_rad
+            return limit_reached
+        except (ValueError, RuntimeError) as exc:
+            self.events.put(("jog_error", str(exc)))
+            raise
+
+    def start_jog(self, direction: int) -> None:
+        motor_enabled = getattr(self, "motor_enabled", getattr(self.motor, "enabled", False))
+        if (
+            self.active_control_panel != "manual"
+            or self.motor is None
+            or not motor_enabled
+            or self.settings is None
+        ):
+            return
+        if direction not in (-1, 1):
+            return
+        try:
+            speed = self._jog_speed_value()
+        except ValueError as exc:
+            messagebox.showerror("Jog speed", str(exc), parent=self.root)
+            return
+
+        if self.jog_thread is not None and self.jog_thread.is_alive():
+            return
+
+        self.jog_direction = direction
+        feedback = self.motor.last_feedback
+        self.jog_reference_position = feedback.position_rad if feedback is not None else 0.0
+        self.jog_target_position = self.jog_reference_position
+        self.jog_speed_limit = speed
+        self.jog_stop_event = threading.Event()
+        initial_velocity = -direction * min(speed, 3.0 * 0.01)
+        try:
+            limit_reached = self._send_jog_velocity(initial_velocity, 0.01)
+        except Exception:
+            self.jog_stop_event = None
+            return
+        if limit_reached:
+            self.jog_stop_event.set()
+
+        self.jog_thread = threading.Thread(
+            target=self._jog_loop,
+            args=(direction, speed, self.jog_stop_event),
+            name="damiao-jog-loop",
+            daemon=True,
+        )
+        self.jog_thread.start()
+        self.status_var.set(f"Jog {('left' if direction < 0 else 'right')} @ {abs(speed):.2f} rad/s")
+        self._log(f"Jog {('left' if direction < 0 else 'right')} at {abs(speed):.2f} rad/s.")
+
+    def _jog_loop(
+        self, direction: int, speed: float, stop_event: threading.Event
+    ) -> None:
+        acceleration_rad_s2 = 3.0
+        velocity = -direction * min(speed, acceleration_rad_s2 * 0.01)
+        last_update = time.monotonic()
+        try:
+            while self.motor is not None and getattr(
+                self, "motor_enabled", getattr(self.motor, "enabled", False)
+            ):
+                now = time.monotonic()
+                delta_s = min(0.05, max(0.001, now - last_update))
+                last_update = now
+                stopping = stop_event.is_set()
+                target_velocity = 0.0 if stopping else -direction * speed
+                max_change = acceleration_rad_s2 * delta_s
+                velocity += max(
+                    -max_change,
+                    min(max_change, target_velocity - velocity),
+                )
+                limit_reached = self._send_jog_velocity(velocity, delta_s)
+                if limit_reached and not stopping:
+                    self.events.put(("jog_limit", "Position target reached the driver's PMAX limit."))
+                    stop_event.set()
+                    stopping = True
+
+                read_feedback = getattr(self.motor, "_read_feedback", None)
+                feedback = read_feedback(timeout_s=0.001) if read_feedback else None
+                if feedback is not None:
+                    self.events.put(("feedback", feedback))
+
+                if stopping and abs(velocity) <= 0.01:
+                    break
+                stop_event.wait(0.01)
+
+            if self.motor is not None and getattr(self.motor, "enabled", False):
+                hold_position = (
+                    self.jog_reference_position
+                    if self.settings.control_mode == 1
+                    else self.jog_target_position
+                )
+                kp_var = getattr(self, "kp_var", None)
+                kd_var = getattr(self, "kd_var", None)
+                kp = float((kp_var.get() if kp_var is not None else "2.0").strip())
+                kd = float((kd_var.get() if kd_var is not None else "1.0").strip())
+                hold_velocity = 0.0 if self.settings.control_mode == 1 else self.jog_speed_limit
+                arbitration_id, payload = self.motor.encode_position_command(
+                    hold_position,
+                    hold_velocity,
+                    0.0 if self.settings.control_mode == 1 else kp,
+                    kd,
+                )
+                self.motor._send(arbitration_id, payload)
+                self.jog_target_position = hold_position
+            self.events.put(("jog_stopped", None))
+        except (ValueError, RuntimeError, can.CanError, OSError) as exc:
+            stop_event.set()
+            self.events.put(("jog_error", str(exc)))
+
+    def stop_jog(self) -> None:
+        if self.jog_stop_event is None:
+            return
+        self.jog_stop_event.set()
+        self.status_var.set("Jog decelerating; motor remains enabled")
+        self._log("Jog released; decelerating to a hold without disabling the motor.")
 
     def enter_motor(self) -> None:
         if self.motor is None:
@@ -496,72 +950,109 @@ class MotorControlApp:
         self._start_worker("Reading parameters", self.motor.read_present_parameters)
 
     def send_target(self) -> None:
-        if self.motor is None or self.settings is None:
-            messagebox.showwarning("Motor not applied", "Apply the CAN settings and read the driver first.")
+        if self.active_control_panel != "target":
             return
-        if not self.motor_enabled:
+        if not self.motor_enabled or self.motor is None or self.settings is None:
             messagebox.showwarning(
                 "Motor disabled",
-                "Enter Motor first and wait for the status indicator to turn green.",
+                "Connect and Enter Motor before sending a saved target.",
                 parent=self.root,
             )
             return
-
-        try:
-            angle_rad, speed_rad_s, kp, kd = self._target_values()
-            safe_speed = env_float("DAMIAO_SAFE_MAX_SPEED_RAD_S", 0.5)
-            if speed_rad_s <= 0:
-                raise ValueError("Speed must be greater than zero.")
-            if speed_rad_s > safe_speed:
-                raise ValueError(
-                    f"Speed exceeds the initial software cap of {safe_speed:g} rad/s in .env."
-                )
-            if abs(angle_rad) > self.settings.position_range_rad:
-                raise ValueError(
-                    f"Angle is outside the driver's PMAX range ±{self.settings.position_range_rad:g} rad."
-                )
-            if speed_rad_s > self.settings.velocity_range_rad_s:
-                raise ValueError(
-                    f"Speed exceeds the driver's VMAX {self.settings.velocity_range_rad_s:g} rad/s."
-                )
-        except ValueError as exc:
-            messagebox.showerror("Target values", str(exc), parent=self.root)
+        if self.saved_target is None:
+            messagebox.showwarning(
+                "No saved target",
+                "Save a target before holding Send.",
+                parent=self.root,
+            )
+            return
+        if self.busy:
             return
 
-        if not messagebox.askyesno(
-            "Confirm motor movement",
-            f"Move to {angle_rad:.3f} rad at {speed_rad_s:.3f} rad/s?\n\n"
-            "Make sure the motor is securely mounted and the path is clear.",
-            parent=self.root,
-        ):
-            return
-
-        self.cancel_event.clear()
+        target = self.saved_target
         motor = self.motor
+        self.cancel_event.clear()
+        self.disable_after_cancel = False
 
         def move() -> MotorFeedback:
-            return motor.move_to_position(
-                position_rad=angle_rad,
-                max_velocity_rad_s=speed_rad_s,
+            feedback = motor.move_to_position(
+                position_rad=target.position_rad,
+                max_velocity_rad_s=target.speed_rad_s,
                 position_tolerance_rad=env_float("DAMIAO_POSITION_TOLERANCE_RAD", 0.05),
                 velocity_tolerance_rad_s=env_float("DAMIAO_VELOCITY_TOLERANCE_RAD_S", 0.1),
                 timeout_s=env_float("DAMIAO_MOVE_TIMEOUT_S", 30.0),
                 command_rate_hz=env_float("DAMIAO_COMMAND_RATE_HZ", 20.0),
-                kp=kp,
-                kd=kd,
+                kp=target.kp,
+                kd=target.kd,
                 cancel_event=self.cancel_event,
                 progress_callback=lambda feedback: self.events.put(("feedback", feedback)),
                 enable_first=False,
+                disable_on_cancel=False,
+            )
+            interval_s = 1.0 / env_float("DAMIAO_COMMAND_RATE_HZ", 20.0)
+            hold_velocity = 0.0 if self.settings.control_mode == 1 else target.speed_rad_s
+            while not self.cancel_event.is_set():
+                if not motor.enabled:
+                    raise RuntimeError("Motor left Enable Mode while holding the saved target.")
+                arbitration_id, payload = motor.encode_position_command(
+                    target.position_rad,
+                    hold_velocity,
+                    target.kp,
+                    target.kd,
+                )
+                motor._send(arbitration_id, payload)
+                feedback = motor._read_feedback(timeout_s=interval_s)
+                if feedback is not None:
+                    if feedback.status != 1:
+                        motor.enabled = False
+                        raise RuntimeError(
+                            f"Drive reported status {feedback.status}; motor is no longer enabled."
+                        )
+                    self.events.put(("feedback", feedback))
+                self.cancel_event.wait(interval_s)
+
+            raise MoveCancelledError(
+                "Target released; motor remains enabled at the held target position."
             )
 
         self._log(
-            f"Send target: {angle_rad:.3f} rad, {speed_rad_s:.3f} rad/s "
-            f"using mode {self.settings.control_mode}."
+            f"Hold-send target: CAN 0x{target.arbitration_id:03X} "
+            f"[{target.payload.hex(' ').upper()}], relative {target.relative_angle_rad:.3f} rad, "
+            f"motor {target.position_rad:.3f} rad, speed cap {target.speed_rad_s:.3f} rad/s."
         )
-        self._start_worker("Moving motor", move)
+        self._start_worker("Sending target", move)
+
+    def save_target(self) -> None:
+        if self.active_control_panel != "target" or self.busy:
+            return
+        try:
+            relative_angle_rad, speed_rad_s, kp, kd = self._target_values()
+            target = self._build_saved_target(relative_angle_rad, speed_rad_s, kp, kd)
+        except ValueError as exc:
+            messagebox.showerror("Target values", str(exc), parent=self.root)
+            return
+
+        self.saved_target = target
+        self.hex_preview_var.set(
+            f"SAVED TX CAN 0x{target.arbitration_id:03X}  "
+            f"DATA {target.payload.hex(' ').upper()}  |  "
+            f"Relative {target.relative_angle_rad:.3f} rad; motor {target.position_rad:.3f} rad"
+        )
+        self.status_var.set("Target saved; hold Send to run it")
+        self._log(
+            f"Saved target CAN 0x{target.arbitration_id:03X} "
+            f"[{target.payload.hex(' ').upper()}]."
+        )
+        self._update_target_buttons()
+
+    def release_target_send(self) -> None:
+        if self.busy and self.current_task == "Sending target":
+            self.cancel_event.set()
+            self.status_var.set("Target released; holding current position")
 
     def stop_motor(self) -> None:
         if self.busy:
+            self.disable_after_cancel = self.current_task == "Sending target"
             self.cancel_event.set()
             self.status_var.set("Stopping: sending disable command...")
             self._log("Stop requested; cancellation sends Disable and removes motor torque.")
@@ -595,33 +1086,77 @@ class MotorControlApp:
                 if isinstance(feedback, MotorFeedback):
                     self._show_feedback(feedback)
                 continue
+            if event == "jog_error":
+                self.jog_thread = None
+                self.jog_stop_event = None
+                self.status_var.set("Jog command failed")
+                self._log(f"JOG ERROR: {payload}")
+                messagebox.showerror("Motor jog", str(payload), parent=self.root)
+                continue
+            if event == "jog_limit":
+                self.status_var.set("Jog stopped at the driver's position limit")
+                self._log(str(payload))
+                continue
+            if event == "jog_stopped":
+                self.jog_thread = None
+                self.jog_stop_event = None
+                self.status_var.set("Jog stopped; motor remains enabled")
+                self._log("Jog stopped at hold position; motor remains enabled.")
+                continue
 
+            finished_task = self.current_task
+            self.current_task = None
             self.busy = False
             self.worker = None
             self.cancel_event.clear()
+            self.cancel_connection_button.configure(state="disabled")
+            if finished_task == "Connecting":
+                self.connection_cancel_event.clear()
             self.apply_button.configure(state="normal")
             self.motor_enabled = bool(self.motor is not None and self.motor.enabled)
             self.enter_button.configure(
                 state="normal" if self.motor is not None and not self.motor_enabled else "disabled"
             )
-            self.send_button.configure(state="normal" if self.motor_enabled else "disabled")
+            self._update_target_buttons()
             self.parameter_button.configure(state="normal" if self.motor is not None else "disabled")
             self.stop_button.configure(state="normal" if self.motor_enabled else "disabled")
-            self._set_motor_state(self.motor_enabled)
-
+            self._set_jog_buttons(self.motor_enabled)
+            self.save_zero_button.configure(
+                state="normal" if self.motor_enabled and self.motor.last_feedback is not None else "disabled"
+            )
             if event == "error":
+                if finished_task == "Connecting":
+                    self.bus = None
+                    self.motor = None
+                    self.settings = None
+                    self.connection_state_var.set("CAN DISCONNECTED")
+                    self.connection_state_label.configure(style="MotorOff.TLabel")
+                    self.enter_button.configure(state="disabled")
+                    self.send_button.configure(state="disabled")
+                    self.parameter_button.configure(state="disabled")
                 self.status_var.set("Operation failed")
                 self._log(f"ERROR: {payload}")
                 messagebox.showerror("Motor operation", str(payload), parent=self.root)
-            elif event == "cancelled":
-                self.status_var.set("Move stopped; motor disabled")
+            elif event == "connection_cancelled":
+                self.connection_state_var.set("CAN DISCONNECTED")
+                self.connection_state_label.configure(style="MotorOff.TLabel")
+                self.status_var.set("Connection cancelled")
                 self._log(str(payload))
-            elif event == "Applying connection":
+            elif event == "cancelled":
+                self._set_motor_state(self.motor_enabled)
+                self.status_var.set(str(payload))
+                self._log(str(payload))
+            elif event == "Connecting":
                 bus, motor, settings = payload
                 self.bus = bus
                 self.motor = motor
                 self.settings = settings
+                self.zero_offset_rad = 0.0
+                self.saved_target = None
+                self.zero_status_var.set("Zero offset: 0.000 rad (not saved)")
                 self.motor_enabled = False
+                self.connection_state_var.set("CAN CONNECTED")
+                self.connection_state_label.configure(style="MotorOn.TLabel")
                 self._set_motor_state(False)
                 self.enter_button.configure(state="normal")
                 self.send_button.configure(state="disabled")
@@ -637,6 +1172,7 @@ class MotorControlApp:
                 self.status_var.set("Connected and verified")
                 self._log(self.driver_info_var.get())
                 self._update_hex_preview()
+                self._update_target_buttons()
             elif event == "Entering Motor":
                 feedback = payload
                 if isinstance(feedback, MotorFeedback):
@@ -644,8 +1180,8 @@ class MotorControlApp:
                 self.motor_enabled = True
                 self._set_motor_state(True)
                 self.enter_button.configure(state="disabled")
-                self.send_button.configure(state="normal")
                 self.stop_button.configure(state="normal")
+                self._update_target_buttons()
                 self.status_var.set("Motor enabled; ready to send target")
                 self._log("Enable acknowledged: motor status is green.")
             elif event == "Moving motor":
@@ -667,9 +1203,16 @@ class MotorControlApp:
                 self._set_motor_state(False)
                 self.enter_button.configure(state="normal" if self.motor is not None else "disabled")
                 self.send_button.configure(state="disabled")
+                self.hold_send_button.configure(state="disabled")
                 self.stop_button.configure(state="disabled")
+                self._set_jog_buttons(False)
                 self.status_var.set(str(payload))
                 self._log(str(payload))
+
+        if self.closing and not self.busy:
+            self._finish_close()
+        else:
+            self.root.after(100, self._poll_events)
 
     def _set_motor_state(self, enabled: bool) -> None:
         self.motor_state_var.set("MOTOR ENABLED" if enabled else "MOTOR DISABLED")
@@ -678,8 +1221,11 @@ class MotorControlApp:
     def _show_feedback(self, feedback: MotorFeedback) -> None:
         self.motor_enabled = feedback.status == 1
         self._set_motor_state(self.motor_enabled)
+        if hasattr(self, "save_zero_button"):
+            self.save_zero_button.configure(state="normal" if self.motor_enabled else "disabled")
+        relative_position = feedback.position_rad - self.zero_offset_rad
         self.feedback_var.set(
-            f"Pos {feedback.position_rad:.3f} rad  |  "
+            f"Pos {relative_position:.3f} rad from zero  |  "
             f"Vel {feedback.velocity_rad_s:.3f} rad/s  |  "
             f"Torque {feedback.torque_nm:.3f} Nm  |  "
             f"Driver {feedback.driver_temperature_c} C  |  "
@@ -710,11 +1256,6 @@ class MotorControlApp:
                 values=(f"0x{parameter.address:02X}", parameter.name, value_text, parameter.unit),
             )
 
-        if self.closing and not self.busy:
-            self._finish_close()
-        else:
-            self.root.after(100, self._poll_events)
-
     def _on_close(self) -> None:
         if self.busy:
             if messagebox.askyesno(
@@ -723,8 +1264,13 @@ class MotorControlApp:
                 parent=self.root,
             ):
                 self.closing = True
-                self.cancel_event.set()
-                self.status_var.set("Stopping motor before closing...")
+                if self.current_task == "Connecting":
+                    self.connection_cancel_event.set()
+                    self.status_var.set("Cancelling connection before closing...")
+                else:
+                    self.disable_after_cancel = self.current_task == "Sending target"
+                    self.cancel_event.set()
+                    self.status_var.set("Stopping motor before closing...")
             return
 
         disable = False

@@ -11,6 +11,8 @@ cd F:\Damiao_Control\motor_controller
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 ```
+cd f:\Damiao_Control\motor_controller
+.\.venv\Scripts\python.exe -m single_motor.gui 
 
 Local connection settings are in `.env`. The starter configuration uses CAN ID `0x01`, Master ID `0x11`, CAN bitrate `1 Mbps`, and a conservative software speed cap of `0.5 rad/s`.
 
@@ -20,7 +22,7 @@ Start the desktop GUI with:
 python -m single_motor.gui
 ```
 
-The GUI accepts angle in radians or degrees and speed in rad/s or rpm. **Apply & read driver** connects to the adapter, checks the selected IDs against those stored on the motor, and displays firmware, sub-version, mode, and command ranges. It does not write IDs or save parameters to flash. **Enter Motor** sends the enable frame; the indicator turns green only after the driver reports enabled status. The live preview shows the target arbitration ID and eight payload bytes in hex. **Send target** is enabled only while the motor is green. **Stop / Disable** sends the disable frame and turns the indicator red. **Read present parameters** reads V3/V17 CAN registers into a table. MIT and Position-Velocity modes are supported; configure the mode in Damiao Debugging Tool if needed.
+The GUI accepts angle in radians or degrees and speed in rad/s or rpm. **Connect** opens the selected adapter and verifies the configured CAN IDs and driver registers; **Cancel** aborts a pending register read. A separate CAN indicator reports verified communication. **Enter Motor** sends the enable frame; the motor indicator turns green only after the driver reports enabled status. These indicators describe the CAN link and motor driver state, not a controllable USB2CAN LED. The live preview and send log show the arbitration ID and eight payload bytes in hex. **Send target** is enabled only while the motor is green. **Stop / Disable** sends the disable frame and turns the motor indicator red. **Read present parameters** reads V3/V17 CAN registers into a table. MIT and Position-Velocity modes are supported; configure the mode in Damiao Debugging Tool if needed.
 
 ## Connection requirement
 

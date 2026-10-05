@@ -1,4 +1,4 @@
-"""Move one DM-J4310-2EC V1.2 motor to an absolute output-shaft angle."""
+"""Move one DM4310 V3 motor to an absolute output-shaft angle."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from serial.tools import list_ports
 
 from single_motor.damiao_v12 import DamiaoV12
+from single_motor.usb2can_serial import DamiaoUSB2CANBus, USB2CAN_CAN_BAUDS_KBPS
 
 
 PROJECT_DIR = Path(__file__).resolve().parents[1]
@@ -30,9 +31,9 @@ def env_float(name: str, default: float) -> float:
     return float(value) if value else default
 
 
-def validate_slcan_port(channel: str) -> None:
+def validate_usb2can_port(channel: str) -> None:
     if not re.fullmatch(r"COM\d+", channel, flags=re.IGNORECASE):
-        raise ValueError("SLCAN channel must be a Windows COM port, for example COM5.")
+        raise ValueError("USB2CAN channel must be a Windows COM port, for example COM5.")
 
     matches = [
         item for item in list_ports.comports() if item.device.upper() == channel.upper()
@@ -46,6 +47,9 @@ def validate_slcan_port(channel: str) -> None:
     if port is None:
         available = ", ".join(item.device for item in list_ports.comports()) or "none"
         raise RuntimeError(f"{channel} is not a USB serial adapter. Detected ports: {available}.")
+
+
+validate_slcan_port = validate_usb2can_port
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,13 +75,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    can_interface = os.getenv("DAMIAO_CAN_INTERFACE", "slcan")
     can_channel = os.getenv("DAMIAO_CAN_CHANNEL", "COM3")
     bitrate = env_int("DAMIAO_CAN_BITRATE", 1_000_000)
-    serial_baudrate = env_int("DAMIAO_CAN_SERIAL_BAUDRATE", 115_200)
-    can_id = env_int("DAMIAO_CAN_ID", 0x01)
-    master_id = env_int("DAMIAO_MASTER_ID", 0x11)
-    safe_speed = env_float("DAMIAO_SAFE_MAX_SPEED_RAD_S", 0.5)
+    serial_baudrate = env_int("DAMIAO_CAN_SERIAL_BAUDRATE", 921_600)
+    can_id = env_int("DAMIAO_CAN_ID", 0x02)
+    master_id = env_int("DAMIAO_MASTER_ID", 0x12)
+    safe_speed = env_float("DAMIAO_SAFE_MAX_SPEED_RAD_S", 30.0)
     position_tolerance = env_float("DAMIAO_POSITION_TOLERANCE_RAD", 0.05)
     velocity_tolerance = env_float("DAMIAO_VELOCITY_TOLERANCE_RAD_S", 0.1)
     move_timeout = env_float("DAMIAO_MOVE_TIMEOUT_S", 30.0)
@@ -95,6 +98,11 @@ def main() -> int:
     if command_rate <= 0 or move_timeout <= 0:
         raise ValueError("Command rate and move timeout must be greater than zero.")
 
+    try:
+        can_bitrate_code = USB2CAN_CAN_BAUDS_KBPS.index(bitrate // 1000)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported Damiao USB2CAN CAN bitrate: {bitrate} bit/s.") from exc
+
     print(
         f"Target: {args.angle:g} rad; max speed: {args.speed:g} rad/s; "
         f"CAN ID: 0x{can_id:02X}; Master ID: 0x{master_id:02X}; "
@@ -104,17 +112,12 @@ def main() -> int:
         print("Preview only. Add --execute to connect and move the motor.")
         return 0
 
-    if can_interface != "slcan":
-        raise ValueError(
-            f"This starter currently supports the SLCAN adapter only, not '{can_interface}'."
-        )
-    validate_slcan_port(can_channel)
+    validate_usb2can_port(can_channel)
 
-    with can.Bus(
-        interface=can_interface,
+    with DamiaoUSB2CANBus(
         channel=can_channel,
-        bitrate=bitrate,
-        tty_baudrate=serial_baudrate,
+        baudrate=serial_baudrate,
+        can_bitrate_code=can_bitrate_code,
     ) as bus:
         motor = DamiaoV12(bus, can_id=can_id, master_id=master_id)
         settings = motor.verify_configuration()
