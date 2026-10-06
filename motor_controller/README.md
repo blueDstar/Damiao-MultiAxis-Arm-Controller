@@ -1,6 +1,14 @@
 # Damiao Motor Controller
 
-Python controller for one DM4310 V3 motor running firmware 5017. The GUI supports the motor's current MIT mode and Position-Velocity mode; `multi_motor/` is reserved for future coordinated control.
+Python controller for DM4310 V3 motors running firmware 5017. The single-motor GUI supports MIT and Position-Velocity modes. `multi_motor/` provides independent controls for multiple motors sharing one USB2CAN adapter.
+
+For the two-motor GUI (CAN IDs `0x01`/`0x02`, Master IDs `0x11`/`0x12`), run from this directory:
+
+```powershell
+python run_multi_motor.py
+```
+
+See [multi_motor/README.md](multi_motor/README.md) for independent Enable, target, jog, software zero, feedback routing and Disable controls.
 
 ## Setup
 
@@ -26,7 +34,7 @@ The GUI accepts angle in radians or degrees and speed in rad/s or rpm. **Connect
 
 ## Connection requirement
 
-Windows currently exposes a USB device on `COM3` (`VID:PID 2E88:4603`) alongside a stale Bluetooth record with the same COM number; the GUI now prefers the USB device. Its current transport uses SLCAN. A read-only query opened COM3 but received no motor response, so SLCAN compatibility or the adapter's vendor runtime is not yet confirmed. The GUI does not send Enable or movement commands when this read fails. If Damiao Debugging Tool communicates with this adapter, use the matching USB2CAN protocol/runtime rather than changing motor IDs or CAN bitrate blindly. Adapter serial baud and CAN bitrate are separate settings.
+The connection code prefers USB serial devices over Bluetooth records with the same COM number. Both GUIs use the Damiao USB2CAN vendor serial framing in `single_motor/usb2can_serial.py`, with a default serial baud of 921600. They verify motor registers before allowing Enable or motion. Adapter serial baud and CAN bitrate are separate settings. Select the actual adapter COM port and close Damiao Debugging Tool or other programs holding that port before connecting.
 
 ## Move to an angle from the command line
 

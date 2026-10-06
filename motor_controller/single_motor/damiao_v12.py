@@ -6,7 +6,7 @@ import math
 import struct
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import can
@@ -98,12 +98,37 @@ class MotorSettings:
 
 @dataclass(frozen=True)
 class MotorFeedback:
-    status: int
+    error_code: int
     position_rad: float
     velocity_rad_s: float
     torque_nm: float
     driver_temperature_c: int
     motor_temperature_c: int
+    raw_payload: bytes = b""
+    received_at: float = field(default_factory=time.monotonic)
+
+    @property
+    def status_code(self) -> int:
+        """The ERR nibble includes normal states: 0 disabled, 1 enabled."""
+        return self.error_code
+
+    @property
+    def is_enabled(self) -> bool:
+        return self.status_code == 1
+
+    @property
+    def has_fault(self) -> bool:
+        return self.status_code not in (0, 1)
+
+    @property
+    def status_text(self) -> str:
+        return {
+            0: "Disabled", 1: "Enabled", 3: "Output calibration error",
+            4: "Sensor output error", 5: "Motor encoder calibration error",
+            8: "Overvoltage", 9: "Undervoltage", 10: "Overcurrent",
+            11: "MOS overtemperature", 12: "Motor overtemperature",
+            13: "Communication lost", 14: "Overload",
+        }.get(self.status_code, f"Unknown status 0x{self.status_code:X}")
 
 
 @dataclass(frozen=True)
@@ -336,23 +361,24 @@ class DamiaoMotor:
             if feedback_id != self.can_id:
                 continue
 
-            position_raw = int.from_bytes(payload[1:3], byteorder="big", signed=True)
+            # MIT feedback uses offset-binary uint fields, like commands.
+            # Midpoints 0x7FFF/0x8000 and 0x7FF/0x800 represent near zero,
+            # not a two's-complement sign transition.
+            position_raw = int.from_bytes(payload[1:3], byteorder="big", signed=False)
             velocity_raw = (payload[3] << 4) | (payload[4] >> 4)
-            if velocity_raw & 0x800:
-                velocity_raw -= 0x1000
             torque_raw = ((payload[4] & 0x0F) << 8) | payload[5]
-            if torque_raw & 0x800:
-                torque_raw -= 0x1000
 
             feedback = MotorFeedback(
-                status=payload[0] >> 4,
-                position_rad=position_raw * self.position_range_rad / 32768.0,
-                velocity_rad_s=velocity_raw * self.velocity_range_rad_s / 2048.0,
-                torque_nm=torque_raw * self.torque_range_nm / 2048.0,
+                error_code=payload[0] >> 4,
+                position_rad=position_raw * (2 * self.position_range_rad) / 65535.0 - self.position_range_rad,
+                velocity_rad_s=velocity_raw * (2 * self.velocity_range_rad_s) / 4095.0 - self.velocity_range_rad_s,
+                torque_nm=torque_raw * (2 * self.torque_range_nm) / 4095.0 - self.torque_range_nm,
                 driver_temperature_c=payload[6],
                 motor_temperature_c=payload[7],
+                raw_payload=payload,
             )
             self.last_feedback = feedback
+            self.enabled = feedback.is_enabled
             return feedback
         return None
 
@@ -363,12 +389,14 @@ class DamiaoMotor:
         if feedback is None:
             self.last_feedback = None
             raise TimeoutError("No motor feedback after enable command; motion was not started.")
-        if feedback.status != 1:
+        if feedback.has_fault:
             self.last_feedback = feedback
             raise RuntimeError(
-                f"Motor did not enter Enable Mode (status {feedback.status}). "
+                f"Motor reported fault code {feedback.error_code} after Enable. "
                 "Check the fault code in Damiao Debugging Tool."
             )
+        if not feedback.is_enabled:
+            raise RuntimeError("Driver acknowledged Disabled (status 0) after Enable; motor was not enabled.")
         self.enabled = True
         self.last_feedback = feedback
         return feedback
@@ -428,9 +456,15 @@ class DamiaoMotor:
             if not self.enabled:
                 raise RuntimeError("Motor is not enabled. Send the Enter Motor command first.")
             feedback = self.last_feedback
-            if feedback is None or feedback.status != 1:
+            if feedback is None:
                 self.enabled = False
-                raise RuntimeError("Motor is not reporting Enable Mode; send Enter Motor again.")
+                raise RuntimeError("No motor feedback is available; send Enter Motor again.")
+            if not feedback.is_enabled:
+                self.enabled = False
+                raise RuntimeError(
+                    f"Last motor feedback reports {feedback.status_text} (0x{feedback.status_code:X}). "
+                    "Check the controller fault state before enabling again."
+                )
         print(
             f"Enabled at {feedback.position_rad:.3f} rad; "
             f"moving to {position_rad:.3f} rad."
@@ -440,6 +474,9 @@ class DamiaoMotor:
         deadline = time.monotonic() + timeout_s
         stable_samples = 0
         command_position = feedback.position_rad
+        start_position = feedback.position_rad
+        motion_started = time.monotonic()
+        travel_distance = abs(position_rad - start_position)
 
         while time.monotonic() < deadline:
             if cancel_event is not None and cancel_event.is_set():
@@ -465,24 +502,27 @@ class DamiaoMotor:
 
             cycle_started = time.monotonic()
             if self.control_mode == CONTROL_MODE_MIT:
-                remaining = position_rad - command_position
-                max_step = max_velocity_rad_s * interval_s
-                if abs(remaining) <= max_step:
+                # Reference the next command interval on the real clock. A slow
+                # serial read or scheduler must not reduce travel per second.
+                elapsed = cycle_started - motion_started + interval_s
+                travelled = min(travel_distance, max_velocity_rad_s * elapsed)
+                if travelled >= travel_distance:
                     command_position = position_rad
-                    command_velocity = remaining / interval_s
+                    command_velocity = 0.0
                 else:
-                    command_velocity = math.copysign(max_velocity_rad_s, remaining)
-                    command_position += command_velocity * interval_s
+                    direction = position_rad - start_position
+                    command_velocity = math.copysign(max_velocity_rad_s, direction)
+                    command_position = start_position + math.copysign(travelled, direction)
                 arbitration_id, command = self.encode_position_command(
                     command_position, command_velocity, kp, kd
                 )
             self._send(arbitration_id, command)
             feedback = self._read_feedback(timeout_s=interval_s)
             if feedback is not None:
-                if feedback.status != 1:
+                if not feedback.is_enabled:
                     self.enabled = False
                     raise RuntimeError(
-                        f"Drive reported status {feedback.status}; motor is no longer in Enable Mode. "
+                        f"Drive reported fault code {feedback.error_code}. "
                         "Check the controller fault state before enabling again."
                     )
 
@@ -490,6 +530,7 @@ class DamiaoMotor:
                 if (
                     position_error <= position_tolerance_rad
                     and abs(feedback.velocity_rad_s) <= velocity_tolerance_rad_s
+                    and (self.control_mode != CONTROL_MODE_MIT or command_position == position_rad)
                 ):
                     stable_samples += 1
                     if stable_samples >= 3:

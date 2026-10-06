@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import struct
 import threading
@@ -23,6 +25,7 @@ from single_motor.damiao_v12 import (
     ConnectionCancelledError,
     DamiaoV12,
     MoveCancelledError,
+    MotorFeedback,
 )
 from single_motor.gui import MotorControlApp, SavedTarget
 from single_motor.move_to_angle import validate_slcan_port
@@ -38,6 +41,7 @@ from single_motor.usb2can_serial import (
 class FakeBus:
     def __init__(self, control_mode: int = 2) -> None:
         self.control_mode = control_mode
+        self.feedback_error_code = 1
         self.sent: list[can.Message] = []
         self.received: deque[can.Message] = deque()
         self.register_values = {
@@ -70,25 +74,24 @@ class FakeBus:
 
         if message.arbitration_id in (0x01, 0x101):
             if message.data[-1] in (0xFC, 0xFD):
-                self.received.append(self.feedback(0.0))
+                self.received.append(self.feedback(0.0, self.feedback_error_code))
             elif message.arbitration_id == 0x01:
                 position_raw = int.from_bytes(message.data[:2], byteorder="big")
                 position = position_raw * 25.0 / 65535.0 - 12.5
-                self.received.append(self.feedback(position))
+                self.received.append(self.feedback(position, self.feedback_error_code))
             else:
                 position_rad, _ = struct.unpack("<ff", message.data)
-                self.received.append(self.feedback(position_rad))
-
+                self.received.append(self.feedback(position_rad, self.feedback_error_code))
     def recv(self, timeout: float | None = None) -> can.Message | None:
         if self.received:
             return self.received.popleft()
         return None
 
     @staticmethod
-    def feedback(position_rad: float) -> can.Message:
-        position_raw = round(position_rad * 32768 / 12.5)
-        position_bytes = position_raw.to_bytes(2, byteorder="big", signed=True)
-        payload = bytes((0x11,)) + position_bytes + bytes((0, 0, 0, 25, 30))
+    def feedback(position_rad: float, error_code: int = 1) -> can.Message:
+        position_raw = round((position_rad + 12.5) * 65535 / 25.0)
+        position_bytes = position_raw.to_bytes(2, byteorder="big", signed=False)
+        payload = bytes((error_code << 4 | 0x01,)) + position_bytes + bytes((0x80, 0x08, 0x00, 25, 30))
         return can.Message(arbitration_id=0x11, is_extended_id=False, data=payload)
 
 
@@ -199,6 +202,28 @@ class DamiaoV12Tests(unittest.TestCase):
         self.assertEqual(len(bus.sent), 8)
         self.assertTrue(all(frame.arbitration_id == CAN_REGISTER_REQUEST_ID for frame in bus.sent))
 
+    def test_enable_rejects_fault_feedback_code(self) -> None:
+        bus = FakeBus(control_mode=1)
+        bus.feedback_error_code = 2
+        motor = DamiaoV12(bus, can_id=0x01, master_id=0x11)
+        motor.verify_configuration()
+
+        with self.assertRaisesRegex(RuntimeError, "fault code 2"):
+            motor.enable()
+
+        self.assertFalse(motor.enabled)
+        self.assertEqual(motor.last_feedback.error_code, 2)
+
+    def test_enable_requires_enabled_status_one_not_disabled_zero(self) -> None:
+        bus = FakeBus(control_mode=1)
+        bus.feedback_error_code = 0
+        motor = DamiaoV12(bus, can_id=0x01, master_id=0x11)
+        motor.verify_configuration()
+        with self.assertRaisesRegex(RuntimeError, "Disabled"):
+            motor.enable()
+        self.assertFalse(motor.enabled)
+        self.assertFalse(motor.last_feedback.has_fault)
+
     def test_reads_present_parameter_registers(self) -> None:
         bus = FakeBus()
         motor = DamiaoV12(bus, can_id=0x01, master_id=0x11)
@@ -240,7 +265,7 @@ class DamiaoV12Tests(unittest.TestCase):
         self.assertEqual(move_frames[0].data[-1], 0xFC)
         self.assertEqual(move_frames[1].data, struct.pack("<ff", 1.0, 0.2))
         self.assertAlmostEqual(result.position_rad, 1.0, delta=0.001)
-        self.assertEqual(result.torque_nm, 0.0)
+        self.assertAlmostEqual(result.torque_nm, 0.0, delta=10.0 / 4095)
         self.assertEqual(result.driver_temperature_c, 25)
         self.assertEqual(result.motor_temperature_c, 30)
 
@@ -294,7 +319,7 @@ class DamiaoV12Tests(unittest.TestCase):
             any(frame.data[-1] == 0xFD for frame in bus.sent if frame.arbitration_id == 0x01)
         )
 
-    def test_mit_target_90_degrees_reaches_one_and_a_half_pi(self) -> None:
+    def test_mit_target_90_degrees_reaches_pi_over_two(self) -> None:
         bus = FakeBus(control_mode=1)
         motor = DamiaoV12(bus, can_id=0x01, master_id=0x11)
         motor.verify_configuration()
@@ -654,6 +679,9 @@ class SerialPortSelectionTests(unittest.TestCase):
         app.motor_enabled = True
         app.busy = False
         app.saved_target = None
+        app.target_state_lock = threading.Lock()
+        app.target_generation = 0
+        app.target_move_cancel_event = None
         status: list[str] = []
         zero_status: list[str] = []
         app.status_var = SimpleNamespace(set=status.append)
@@ -668,7 +696,7 @@ class SerialPortSelectionTests(unittest.TestCase):
         self.assertEqual(zero_status, ["Zero offset: -0.750 rad"])
         self.assertEqual(status, ["Current feedback position saved as software zero"])
 
-    def test_save_zero_rebases_existing_target_for_resend(self) -> None:
+    def test_save_zero_rebases_target_and_restarts_active_send(self) -> None:
         app = object.__new__(MotorControlApp)
         app.motor = SimpleNamespace(
             last_feedback=SimpleNamespace(position_rad=3.0),
@@ -680,7 +708,11 @@ class SerialPortSelectionTests(unittest.TestCase):
             velocity_range_rad_s=30.0,
         )
         app.motor_enabled = True
-        app.busy = False
+        app.busy = True
+        app.current_task = "Sending target"
+        app.target_state_lock = threading.Lock()
+        app.target_generation = 1
+        app.target_move_cancel_event = threading.Event()
         app.zero_offset_rad = 0.0
         app.saved_target = SavedTarget(0.5, 0.5, 2.0, 2.0, 1.0, 0x102, b"oldframe")
         app.status_var = SimpleNamespace(set=lambda value: None)
@@ -694,6 +726,125 @@ class SerialPortSelectionTests(unittest.TestCase):
         self.assertAlmostEqual(app.zero_offset_rad, 3.0)
         self.assertAlmostEqual(app.saved_target.position_rad, 3.5)
         self.assertAlmostEqual(app.saved_target.relative_angle_rad, 0.5)
+        self.assertTrue(app.target_move_cancel_event.is_set())
+        self.assertEqual(app.target_generation, 2)
+
+    def test_gui_keeps_enable_state_on_enabled_feedback_status(self) -> None:
+        app = object.__new__(MotorControlApp)
+        app.motor = SimpleNamespace(enabled=True)
+        app.zero_offset_rad = 0.0
+        app.motor_enabled = True
+        app._set_motor_state = lambda enabled: setattr(app, "displayed_enabled", enabled)
+        app.feedback_var = SimpleNamespace(set=lambda value: setattr(app, "displayed_feedback", value))
+
+        app._show_feedback(
+            MotorFeedback(
+                error_code=1,
+                position_rad=1.0,
+                velocity_rad_s=0.2,
+                torque_nm=0.0,
+                driver_temperature_c=25,
+                motor_temperature_c=30,
+            )
+        )
+
+        self.assertTrue(app.motor_enabled)
+        self.assertTrue(app.displayed_enabled)
+        self.assertIn("Status Enabled (0x1)", app.displayed_feedback)
+
+    def test_save_zero_restarts_running_sender_with_rebased_target(self) -> None:
+        app = object.__new__(MotorControlApp)
+        app.active_control_panel = "target"
+        app.busy = False
+        app.current_task = None
+        app.motor_enabled = True
+        app.settings = SimpleNamespace(
+            control_mode=2,
+            position_range_rad=12.5,
+            velocity_range_rad_s=30.0,
+        )
+        app.zero_offset_rad = 0.0
+        app.saved_target = SavedTarget(0.5, 0.5, 2.0, 2.0, 1.0, 0x102, b"oldframe")
+        app.target_state_lock = threading.Lock()
+        app.target_generation = 1
+        app.target_move_cancel_event = None
+        app.cancel_event = threading.Event()
+        app.disable_after_cancel = False
+        app.events = Queue()
+        app.status_var = SimpleNamespace(set=lambda value: None)
+        app.zero_status_var = SimpleNamespace(set=lambda value: None)
+        app.hex_preview_var = SimpleNamespace(set=lambda value: None)
+        app._update_target_buttons = lambda: None
+        app._update_hex_preview = lambda: None
+        app._log = lambda *args, **kwargs: None
+        app.root = SimpleNamespace()
+        app.angle_var = SimpleNamespace(get=lambda: "0.5")
+        app.angle_unit_var = SimpleNamespace(get=lambda: "rad")
+        app.speed_var = SimpleNamespace(get=lambda: "2")
+        app.speed_unit_var = SimpleNamespace(get=lambda: "rad/s")
+        app.kp_var = SimpleNamespace(get=lambda: "2")
+        app.kd_var = SimpleNamespace(get=lambda: "1")
+
+        first_move_started = threading.Event()
+        second_move_started = threading.Event()
+        commanded_positions: list[float] = []
+        worker_operation: list[object] = []
+
+        def move_to_position(**kwargs):
+            commanded_positions.append(kwargs["position_rad"])
+            if len(commanded_positions) == 1:
+                first_move_started.set()
+                if not kwargs["cancel_event"].wait(timeout=2.0):
+                    raise AssertionError("Save Zero did not interrupt the original move")
+                raise MoveCancelledError("Target superseded")
+            second_move_started.set()
+            return SimpleNamespace(
+                position_rad=kwargs["position_rad"],
+                velocity_rad_s=0.0,
+                error_code=1,
+                is_enabled=True,
+            )
+
+        app.motor = SimpleNamespace(
+            enabled=True,
+            last_feedback=SimpleNamespace(position_rad=3.0),
+            move_to_position=move_to_position,
+            encode_position_command=lambda position, velocity, kp, kd: (0x102, b"12345678"),
+            _send=lambda arbitration_id, payload: None,
+            _read_feedback=lambda timeout_s: SimpleNamespace(
+                position_rad=3.5,
+                velocity_rad_s=0.0,
+                error_code=1,
+                is_enabled=True,
+            ),
+        )
+        app._start_worker = lambda task, operation: (
+            setattr(app, "busy", True),
+            setattr(app, "current_task", task),
+            worker_operation.append(operation),
+        )
+
+        app.send_target()
+        errors: list[BaseException] = []
+
+        def run_worker() -> None:
+            try:
+                worker_operation[0]()
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run_worker)
+        worker.start()
+        self.assertTrue(first_move_started.wait(timeout=1.0))
+        app.save_zero()
+        self.assertTrue(second_move_started.wait(timeout=1.0))
+        app.cancel_event.set()
+        worker.join(timeout=1.0)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(commanded_positions, [0.5, 3.5])
+        self.assertTrue(errors)
+        self.assertIsInstance(errors[0], MoveCancelledError)
 
     def test_inactive_control_mode_rejects_its_commands(self) -> None:
         app = object.__new__(MotorControlApp)
@@ -732,6 +883,8 @@ class SerialPortSelectionTests(unittest.TestCase):
         app.kd_var = SimpleNamespace(get=lambda: "1")
         app.root = SimpleNamespace()
         app.saved_target = None
+        app.target_state_lock = threading.Lock()
+        app.target_generation = 0
         app.hex_preview_var = SimpleNamespace(set=lambda value: None)
         app.status_var = SimpleNamespace(set=lambda value: None)
         app._log = lambda *args, **kwargs: None
@@ -744,6 +897,63 @@ class SerialPortSelectionTests(unittest.TestCase):
         self.assertEqual(encoded[0][0], -0.5)
         self.assertEqual(app.saved_target.position_rad, -0.5)
         self.assertEqual(app.saved_target.relative_angle_rad, 0.5)
+
+    def test_send_click_starts_persistent_target_worker(self) -> None:
+        app = object.__new__(MotorControlApp)
+        started: list[tuple[str, object]] = []
+        app.active_control_panel = "target"
+        app.busy = False
+        app.motor_enabled = True
+        app.motor = SimpleNamespace(enabled=True)
+        app.settings = SimpleNamespace(control_mode=1)
+        app.saved_target = SavedTarget(0.25, 0.25, 0.2, 2.0, 1.0, 0x01, b"12345678")
+        app.zero_offset_rad = 0.0
+        app.angle_var = SimpleNamespace(get=lambda: "0.25")
+        app.angle_unit_var = SimpleNamespace(get=lambda: "rad")
+        app.speed_var = SimpleNamespace(get=lambda: "0.2")
+        app.speed_unit_var = SimpleNamespace(get=lambda: "rad/s")
+        app.kp_var = SimpleNamespace(get=lambda: "2.0")
+        app.kd_var = SimpleNamespace(get=lambda: "1.0")
+        app.cancel_event = threading.Event()
+        app.events = Queue()
+        app._log = lambda *args, **kwargs: None
+        app._start_worker = lambda task, operation: started.append((task, operation))
+
+        app.send_target()
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][0], "Sending target")
+        self.assertFalse(app.cancel_event.is_set())
+
+    @patch("single_motor.gui.messagebox.showwarning")
+    def test_unsaved_target_edits_cannot_be_sent(self, showwarning) -> None:
+        app = object.__new__(MotorControlApp)
+        app.active_control_panel = "target"
+        app.busy = False
+        app.motor_enabled = True
+        app.zero_offset_rad = 0.0
+        app.settings = SimpleNamespace(position_range_rad=12.5, velocity_range_rad_s=30.0)
+        app.saved_target = SavedTarget(0.25, 0.25, 0.2, 2.0, 1.0, 0x01, b"12345678")
+        app.motor = SimpleNamespace(enabled=True)
+        app.angle_var = SimpleNamespace(get=lambda: "0.5")
+        app.angle_unit_var = SimpleNamespace(get=lambda: "rad")
+        app.speed_var = SimpleNamespace(get=lambda: "0.2")
+        app.speed_unit_var = SimpleNamespace(get=lambda: "rad/s")
+        app.kp_var = SimpleNamespace(get=lambda: "2.0")
+        app.kd_var = SimpleNamespace(get=lambda: "1.0")
+        app.root = SimpleNamespace()
+        started: list[str] = []
+        app._start_worker = lambda task, operation: started.append(task)
+
+        states: dict[str, str] = {}
+        app.send_button = SimpleNamespace(configure=lambda **kwargs: states.update(save=kwargs["state"]))
+        app.hold_send_button = SimpleNamespace(configure=lambda **kwargs: states.update(send=kwargs["state"]))
+        app._update_target_buttons()
+        app.send_target()
+
+        self.assertEqual(states, {"save": "normal", "send": "disabled"})
+        self.assertEqual(started, [])
+        showwarning.assert_called_once()
 
     def test_target_values_converts_90_degrees_to_radians(self) -> None:
         app = object.__new__(MotorControlApp)
@@ -758,6 +968,25 @@ class SerialPortSelectionTests(unittest.TestCase):
 
         self.assertAlmostEqual(angle_rad, math.pi / 2)
         self.assertEqual(speed_rad_s, 0.2)
+
+    def test_saved_mit_target_hex_uses_signed_requested_speed(self) -> None:
+        motor = DamiaoV12(FakeBus(control_mode=1), can_id=0x01, master_id=0x11)
+        settings = motor.verify_configuration()
+        motor.last_feedback = SimpleNamespace(position_rad=0.0)
+        app = object.__new__(MotorControlApp)
+        app.motor = motor
+        app.settings = settings
+        app.zero_offset_rad = 0.0
+
+        positive = app._build_saved_target(math.pi / 2, 0.2, 2.0, 1.0)
+        negative = app._build_saved_target(-math.pi / 2, 0.2, 2.0, 1.0)
+
+        def decode_velocity(payload: bytes) -> float:
+            raw = (payload[2] << 4) | (payload[3] >> 4)
+            return raw * 60.0 / 4095.0 - 30.0
+
+        self.assertAlmostEqual(decode_velocity(positive.payload), 0.2, delta=0.02)
+        self.assertAlmostEqual(decode_velocity(negative.payload), -0.2, delta=0.02)
 
 
 if __name__ == "__main__":

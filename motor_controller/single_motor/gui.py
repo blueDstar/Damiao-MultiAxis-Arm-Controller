@@ -81,6 +81,9 @@ class MotorControlApp:
         self.zero_offset_rad = 0.0
         self.active_control_panel = "target"
         self.saved_target: SavedTarget | None = None
+        self.target_state_lock = threading.Lock()
+        self.target_generation = 0
+        self.target_move_cancel_event: threading.Event | None = None
         self.port_descriptions: dict[str, str] = {}
 
         self.channel_var = tk.StringVar(value=os.getenv("DAMIAO_CAN_CHANNEL", "COM3"))
@@ -333,13 +336,12 @@ class MotorControlApp:
         self.send_button.grid(row=0, column=1, sticky="ew", padx=6)
         self.hold_send_button = ttk.Button(
             actions,
-            text="Hold to send",
+            text="Send",
             style="Jog.TButton",
+            command=self.send_target,
             state="disabled",
         )
         self.hold_send_button.grid(row=0, column=2, sticky="ew", padx=6)
-        self.hold_send_button.bind("<ButtonPress-1>", lambda _event: self.send_target())
-        self.hold_send_button.bind("<ButtonRelease-1>", lambda _event: self.release_target_send())
         self.stop_button = ttk.Button(
             actions,
             text="Stop / Disable",
@@ -453,6 +455,7 @@ class MotorControlApp:
             self.kd_var,
         ):
             variable.trace_add("write", self._update_hex_preview)
+            variable.trace_add("write", self._update_target_buttons)
 
     def refresh_ports(self) -> None:
         ports = list(list_ports.comports())
@@ -625,7 +628,8 @@ class MotorControlApp:
         return self.zero_offset_rad + relative_angle_rad
 
     def save_zero(self) -> None:
-        if self.busy:
+        sending_target = self.busy and self.current_task == "Sending target"
+        if self.busy and not sending_target:
             self.status_var.set("Wait for the target operation to stop before saving zero")
             return
         feedback = self.motor.last_feedback if self.motor is not None else None
@@ -634,20 +638,32 @@ class MotorControlApp:
             return
         self.zero_offset_rad = feedback.position_rad
         self.zero_status_var.set(f"Zero offset: {self.zero_offset_rad:.3f} rad")
-        if self.saved_target is not None:
+        with self.target_state_lock:
             previous_target = self.saved_target
+        if previous_target is not None:
             try:
-                self.saved_target = self._build_saved_target(
+                rebased_target = self._build_saved_target(
                     previous_target.relative_angle_rad,
                     previous_target.speed_rad_s,
                     previous_target.kp,
                     previous_target.kd,
                 )
             except ValueError as exc:
-                self.saved_target = None
+                rebased_target = None
                 self.status_var.set(f"Zero saved; prior target cleared: {exc}")
             else:
-                self.status_var.set("Zero saved; saved target rebased from the current position")
+                status = (
+                    "Zero saved; stream restarting from current position"
+                    if sending_target
+                    else "Zero saved; saved target rebased from the current position"
+                )
+                self.status_var.set(status)
+            with self.target_state_lock:
+                self.saved_target = rebased_target
+                self.target_generation += 1
+                move_cancel_event = self.target_move_cancel_event if sending_target else None
+            if move_cancel_event is not None:
+                move_cancel_event.set()
         else:
             self.status_var.set("Current feedback position saved as software zero")
         self._log(f"Saved software zero at motor position {self.zero_offset_rad:.3f} rad.")
@@ -684,15 +700,31 @@ class MotorControlApp:
         self._update_target_buttons()
         self._update_hex_preview()
 
-    def _update_target_buttons(self) -> None:
+    def _target_inputs_match_saved(self) -> bool:
+        if self.saved_target is None or self.settings is None:
+            return False
+        try:
+            angle_rad, speed_rad_s, kp, kd = self._target_values()
+        except ValueError:
+            return False
+        return all(
+            math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-9)
+            for actual, expected in (
+                (angle_rad, self.saved_target.relative_angle_rad),
+                (self._motor_target_position(angle_rad), self.saved_target.position_rad),
+                (speed_rad_s, self.saved_target.speed_rad_s),
+                (kp, self.saved_target.kp),
+                (kd, self.saved_target.kd),
+            )
+        )
+
+    def _update_target_buttons(self, *_args: str) -> None:
         target_mode = self.active_control_panel == "target"
         can_save = target_mode and self.settings is not None and not self.busy
-        hold_in_progress = self.busy and self.current_task == "Sending target"
         can_send = (
-            target_mode
+            can_save
             and self.motor_enabled
-            and self.saved_target is not None
-            and (not self.busy or hold_in_progress)
+            and self._target_inputs_match_saved()
         )
         self.send_button.configure(state="normal" if can_save else "disabled")
         self.hold_send_button.configure(state="normal" if can_send else "disabled")
@@ -721,9 +753,15 @@ class MotorControlApp:
                 f"Target maps to motor position {position_rad:.3f} rad, outside the "
                 f"driver's PMAX range ±{self.settings.position_range_rad:g} rad."
             )
-        frame_velocity = (
-            0.0 if self.settings.control_mode == 1 else speed_rad_s
-        )
+        if self.settings.control_mode == 1:
+            feedback = getattr(self.motor, "last_feedback", None)
+            current_position = (
+                feedback.position_rad if feedback is not None else self.zero_offset_rad
+            )
+            remaining = position_rad - current_position
+            frame_velocity = math.copysign(speed_rad_s, remaining) if remaining else 0.0
+        else:
+            frame_velocity = speed_rad_s
         arbitration_id, payload = self.motor.encode_position_command(
             position_rad, frame_velocity, kp, kd
         )
@@ -743,14 +781,25 @@ class MotorControlApp:
             return
         try:
             angle_rad, speed_rad_s, kp, kd = self._target_values()
-            motor_position_rad = self._motor_target_position(angle_rad)
-            arbitration_id, payload = self.motor.encode_position_command(
-                motor_position_rad, speed_rad_s, kp, kd
+            preview = self._build_saved_target(angle_rad, speed_rad_s, kp, kd)
+            saved = self.saved_target
+            is_saved = saved is not None and all(
+                math.isclose(actual, expected, abs_tol=1e-9)
+                for actual, expected in (
+                    (saved.relative_angle_rad, preview.relative_angle_rad),
+                    (saved.position_rad, preview.position_rad),
+                    (saved.speed_rad_s, preview.speed_rad_s),
+                    (saved.kp, preview.kp),
+                    (saved.kd, preview.kd),
+                )
             )
+            displayed = saved if is_saved else preview
+            label = "SAVED TARGET" if is_saved else "UNSAVED PREVIEW"
             self.hex_preview_var.set(
-                f"TX CAN ID 0x{arbitration_id:03X}  DATA {payload.hex(' ').upper()}  |  "
-                f"Target {angle_rad:.3f} rad from zero; motor {motor_position_rad:.3f} rad; "
-                f"Feedback Master 0x{self.settings.master_id:03X}"
+                f"{label} CAN 0x{displayed.arbitration_id:03X}  "
+                f"DATA {displayed.payload.hex(' ').upper()}  |  "
+                f"Relative {displayed.relative_angle_rad:.3f} rad; "
+                f"motor {displayed.position_rad:.3f} rad; stream profile changes frames"
             )
         except (ValueError, RuntimeError) as exc:
             self.hex_preview_var.set(f"Frame preview unavailable: {exc}")
@@ -966,6 +1015,13 @@ class MotorControlApp:
                 parent=self.root,
             )
             return
+        if not self._target_inputs_match_saved():
+            messagebox.showwarning(
+                "Unsaved target changes",
+                "Save the edited target before sending it.",
+                parent=self.root,
+            )
+            return
         if self.busy:
             return
 
@@ -975,50 +1031,82 @@ class MotorControlApp:
         self.disable_after_cancel = False
 
         def move() -> MotorFeedback:
-            feedback = motor.move_to_position(
-                position_rad=target.position_rad,
-                max_velocity_rad_s=target.speed_rad_s,
-                position_tolerance_rad=env_float("DAMIAO_POSITION_TOLERANCE_RAD", 0.05),
-                velocity_tolerance_rad_s=env_float("DAMIAO_VELOCITY_TOLERANCE_RAD_S", 0.1),
-                timeout_s=env_float("DAMIAO_MOVE_TIMEOUT_S", 30.0),
-                command_rate_hz=env_float("DAMIAO_COMMAND_RATE_HZ", 20.0),
-                kp=target.kp,
-                kd=target.kd,
-                cancel_event=self.cancel_event,
-                progress_callback=lambda feedback: self.events.put(("feedback", feedback)),
-                enable_first=False,
-                disable_on_cancel=False,
-            )
             interval_s = 1.0 / env_float("DAMIAO_COMMAND_RATE_HZ", 20.0)
-            hold_velocity = 0.0 if self.settings.control_mode == 1 else target.speed_rad_s
             while not self.cancel_event.is_set():
-                if not motor.enabled:
-                    raise RuntimeError("Motor left Enable Mode while holding the saved target.")
-                arbitration_id, payload = motor.encode_position_command(
-                    target.position_rad,
-                    hold_velocity,
-                    target.kp,
-                    target.kd,
-                )
-                motor._send(arbitration_id, payload)
-                feedback = motor._read_feedback(timeout_s=interval_s)
-                if feedback is not None:
-                    if feedback.status != 1:
-                        motor.enabled = False
-                        raise RuntimeError(
-                            f"Drive reported status {feedback.status}; motor is no longer enabled."
-                        )
-                    self.events.put(("feedback", feedback))
-                self.cancel_event.wait(interval_s)
+                with self.target_state_lock:
+                    target = self.saved_target
+                    generation = self.target_generation
+                    move_cancel_event = threading.Event()
+                    self.target_move_cancel_event = move_cancel_event
+                if target is None:
+                    raise RuntimeError("No valid saved target remains to send.")
 
-            raise MoveCancelledError(
-                "Target released; motor remains enabled at the held target position."
-            )
+                try:
+                    feedback = motor.move_to_position(
+                        position_rad=target.position_rad,
+                        max_velocity_rad_s=target.speed_rad_s,
+                        position_tolerance_rad=env_float("DAMIAO_POSITION_TOLERANCE_RAD", 0.05),
+                        velocity_tolerance_rad_s=env_float("DAMIAO_VELOCITY_TOLERANCE_RAD_S", 0.1),
+                        timeout_s=env_float("DAMIAO_MOVE_TIMEOUT_S", 30.0),
+                        command_rate_hz=env_float("DAMIAO_COMMAND_RATE_HZ", 20.0),
+                        kp=target.kp,
+                        kd=target.kd,
+                        cancel_event=move_cancel_event,
+                        progress_callback=lambda value: self.events.put(("feedback", value)),
+                        enable_first=False,
+                        disable_on_cancel=False,
+                    )
+                except MoveCancelledError:
+                    with self.target_state_lock:
+                        target_changed = generation != self.target_generation
+                        if self.target_move_cancel_event is move_cancel_event:
+                            self.target_move_cancel_event = None
+                    if self.cancel_event.is_set():
+                        raise MoveCancelledError("Send stopped; motor disable requested.")
+                    if target_changed:
+                        continue
+                    raise
+                finally:
+                    with self.target_state_lock:
+                        if self.target_move_cancel_event is move_cancel_event:
+                            self.target_move_cancel_event = None
+
+                with self.target_state_lock:
+                    target_changed = generation != self.target_generation
+                if target_changed:
+                    continue
+
+                hold_velocity = (
+                    0.0 if self.settings.control_mode == 1 else target.speed_rad_s
+                )
+                while not self.cancel_event.is_set():
+                    with self.target_state_lock:
+                        if generation != self.target_generation:
+                            break
+                    if not motor.enabled:
+                        raise RuntimeError("Motor is no longer enabled while holding the target.")
+                    arbitration_id, payload = motor.encode_position_command(
+                        target.position_rad,
+                        hold_velocity,
+                        target.kp,
+                        target.kd,
+                    )
+                    motor._send(arbitration_id, payload)
+                    feedback = motor._read_feedback(timeout_s=interval_s)
+                    if feedback is not None:
+                        if not feedback.is_enabled:
+                            motor.enabled = False
+                            raise RuntimeError(
+                                f"Drive reported fault code {feedback.error_code}; "
+                                "motor commands stopped for safety."
+                            )
+                        self.events.put(("feedback", feedback))
+                    self.cancel_event.wait(interval_s)
+
+            raise MoveCancelledError("Send stopped; motor disable requested.")
 
         self._log(
-            f"Hold-send target: CAN 0x{target.arbitration_id:03X} "
-            f"[{target.payload.hex(' ').upper()}], relative {target.relative_angle_rad:.3f} rad, "
-            f"motor {target.position_rad:.3f} rad, speed cap {target.speed_rad_s:.3f} rad/s."
+            "Send stream started; target setpoints will update from the saved profile."
         )
         self._start_worker("Sending target", move)
 
@@ -1032,28 +1120,25 @@ class MotorControlApp:
             messagebox.showerror("Target values", str(exc), parent=self.root)
             return
 
-        self.saved_target = target
-        self.hex_preview_var.set(
-            f"SAVED TX CAN 0x{target.arbitration_id:03X}  "
-            f"DATA {target.payload.hex(' ').upper()}  |  "
-            f"Relative {target.relative_angle_rad:.3f} rad; motor {target.position_rad:.3f} rad"
-        )
-        self.status_var.set("Target saved; hold Send to run it")
+        with self.target_state_lock:
+            self.saved_target = target
+            self.target_generation += 1
+        self._update_hex_preview()
+        self.status_var.set("Target saved; click Send to start")
         self._log(
             f"Saved target CAN 0x{target.arbitration_id:03X} "
             f"[{target.payload.hex(' ').upper()}]."
         )
         self._update_target_buttons()
 
-    def release_target_send(self) -> None:
-        if self.busy and self.current_task == "Sending target":
-            self.cancel_event.set()
-            self.status_var.set("Target released; holding current position")
-
     def stop_motor(self) -> None:
         if self.busy:
             self.disable_after_cancel = self.current_task == "Sending target"
             self.cancel_event.set()
+            with self.target_state_lock:
+                move_cancel_event = self.target_move_cancel_event
+            if move_cancel_event is not None:
+                move_cancel_event.set()
             self.status_var.set("Stopping: sending disable command...")
             self._log("Stop requested; cancellation sends Disable and removes motor torque.")
             return
@@ -1219,7 +1304,9 @@ class MotorControlApp:
         self.motor_state_label.configure(style="MotorOn.TLabel" if enabled else "MotorOff.TLabel")
 
     def _show_feedback(self, feedback: MotorFeedback) -> None:
-        self.motor_enabled = feedback.status == 1
+        self.motor_enabled = bool(
+            self.motor is not None and self.motor.enabled and feedback.is_enabled
+        )
         self._set_motor_state(self.motor_enabled)
         if hasattr(self, "save_zero_button"):
             self.save_zero_button.configure(state="normal" if self.motor_enabled else "disabled")
@@ -1230,7 +1317,7 @@ class MotorControlApp:
             f"Torque {feedback.torque_nm:.3f} Nm  |  "
             f"Driver {feedback.driver_temperature_c} C  |  "
             f"Motor {feedback.motor_temperature_c} C  |  "
-            f"Status {feedback.status}"
+            f"Status {feedback.status_text} (0x{feedback.status_code:X})"
         )
 
     def _display_parameters(self, parameters: list[PresentParameter]) -> None:
@@ -1270,6 +1357,10 @@ class MotorControlApp:
                 else:
                     self.disable_after_cancel = self.current_task == "Sending target"
                     self.cancel_event.set()
+                    with self.target_state_lock:
+                        move_cancel_event = self.target_move_cancel_event
+                    if move_cancel_event is not None:
+                        move_cancel_event.set()
                     self.status_var.set("Stopping motor before closing...")
             return
 
