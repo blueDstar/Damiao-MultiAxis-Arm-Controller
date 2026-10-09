@@ -16,6 +16,7 @@ from serial.tools import list_ports
 
 from multi_motor.controller import JOG_MAX_SPEED_RAD_S, MultiMotorController
 from multi_motor.trajectory import PositionTrajectory
+from multi_motor.plots import MotorPlots
 from multi_motor.theme import BACKGROUND, INPUT, NEON, WHITE, MUTED, BORDER, apply_theme
 from single_motor.move_to_angle import validate_usb2can_port
 from single_motor.usb2can_serial import DamiaoUSB2CANBus, USB2CAN_CAN_BAUDS_KBPS
@@ -66,11 +67,13 @@ class MotorPanel:
         self.badge = tk.StringVar(value="● CHƯA XÁC MINH")
         self.angle = tk.StringVar(value="0")
         self.angle_unit = tk.StringVar(value="deg")
+        self.target_kind = tk.StringVar(value="relative")
+        self.saved_target_kind = None
         self.speed = tk.StringVar(value="0.2")
         self.speed_unit = tk.StringVar(value="rad/s")
-        self.kp = tk.StringVar(value="2")
+        self.kp = tk.StringVar(value="0")
         self.kd = tk.StringVar(value="1")
-        self.trajectory_info = tk.StringVar(value="POSITION ±30 rad/s · Chiều theo góc đích · 0 = dừng")
+        self.trajectory_info = tk.StringVar(value="Góc tổng nhiều vòng · ±30 rad/s · 0 = dừng")
         self._previous_units = {"angle": "deg", "speed": "rad/s", "jog": "rad/s"}
         self._converting_units = False
         self.buttons = {}
@@ -122,11 +125,15 @@ class MotorPanel:
         self.position_controls = ttk.Frame(self.frame)
         self.position_controls.pack(fill="x")
         self.manual_controls = ttk.Frame(self.frame)
+        target_mode = ttk.Frame(self.position_controls)
+        target_mode.pack(fill="x", pady=(0, 7))
+        ttk.Radiobutton(target_mode, text="Quay thêm từ hiện tại", variable=self.target_kind, value="relative").pack(side="left", padx=(0, 14))
+        ttk.Radiobutton(target_mode, text="Tới góc từ zero", variable=self.target_kind, value="absolute").pack(side="left")
         values = ttk.Frame(self.position_controls)
         values.pack(fill="x", pady=(0, 6))
         for column in range(4):
             values.columnconfigure(column, weight=2 if column < 2 else 1)
-        for index, (label, variable, width) in enumerate((("GÓC TỪ ZERO", self.angle, 5), ("TỐC ĐỘ", self.speed, 5), ("Kp", self.kp, 4), ("Kd", self.kd, 4))):
+        for index, (label, variable, width) in enumerate((("GÓC (XEM CHẾ ĐỘ)", self.angle, 5), ("TỐC ĐỘ", self.speed, 5), ("Kp MIT = 0", self.kp, 4), ("Kd", self.kd, 4))):
             field = ttk.Frame(values)
             field.grid(row=0, column=index, sticky="ew", padx=(0, 6), pady=(0, 5))
             ttk.Label(field, text=label, style="Muted.TLabel").pack(anchor="w", pady=(0, 4))
@@ -135,6 +142,8 @@ class MotorPanel:
             entry = ttk.Entry(line, textvariable=variable, width=width)
             entry.pack(side="left", fill="x", expand=True, padx=(0, 5))
             self.inputs.append(entry)
+            if variable is self.kp:
+                entry.configure(state="readonly")
             if variable is self.angle:
                 unit = ttk.Combobox(line, textvariable=self.angle_unit, values=("deg", "rad"), width=4, state="readonly")
                 unit.pack(side="left")
@@ -163,27 +172,25 @@ class MotorPanel:
         ttk.Label(manual_values, text="Kd").pack(side="left", padx=(0, 5))
         ttk.Entry(manual_values, textvariable=self.jog_kd, width=5).pack(side="left")
         ttk.Label(self.manual_controls, textvariable=self.jog_limit_text, style="Muted.TLabel").pack(anchor="w", pady=(0, 3))
-        ttk.Label(self.manual_controls, text="Jog +/− chọn chiều · Giữ tốc độ dùng dấu của số nhập", style="Muted.TLabel").pack(anchor="w", pady=(0, 7))
+        ttk.Label(self.manual_controls, text="Bấm một lần để chạy liên tục · Bấm DỪNG JOG để dừng", style="Muted.TLabel").pack(anchor="w", pady=(0, 7))
         jog_buttons = ttk.Frame(self.manual_controls)
         jog_buttons.pack(fill="x", pady=(0, 8))
         jog_buttons.columnconfigure(0, weight=1, uniform="jog")
         jog_buttons.columnconfigure(1, weight=1, uniform="jog")
-        for column, (name, title, direction) in enumerate((("jog_minus", "◀  GIỮ JOG −", -1), ("jog_plus", "GIỮ JOG +  ▶", 1))):
-            button = ttk.Button(jog_buttons, text=title)
+        for column, (name, title, direction) in enumerate((("jog_minus", "◀  CHẠY JOG −", -1), ("jog_plus", "CHẠY JOG +  ▶", 1))):
+            button = ttk.Button(jog_buttons, text=title, command=lambda d=direction: self.start_jog(d))
             button.grid(row=0, column=column, sticky="ew", padx=(0, 5), pady=(0, 5))
-            button.bind("<ButtonPress-1>", lambda event, d=direction: self.start_jog(d))
             self.buttons[name] = button
         self.buttons["jog_stop"] = ttk.Button(jog_buttons, text="DỪNG JOG", command=self.stop_motion)
         self.buttons["jog_stop"].grid(row=1, column=0, sticky="ew", padx=(0, 5))
-        self.buttons["jog_signed"] = ttk.Button(jog_buttons, text="GIỮ TỐC ĐỘ ĐÃ NHẬP", style="Primary.TButton")
+        self.buttons["jog_signed"] = ttk.Button(jog_buttons, text="CHẠY TỐC ĐỘ ĐÃ NHẬP", style="Primary.TButton", command=lambda: self.start_jog(None))
         self.buttons["jog_signed"].grid(row=1, column=1, sticky="ew", padx=(0, 5))
-        self.buttons["jog_signed"].bind("<ButtonPress-1>", lambda _: self.start_jog(None))
         ttk.Label(self.frame, textvariable=self.hex_text, style="Hex.TLabel", wraplength=505).pack(fill="x", pady=(0, 6))
         rx_label = ttk.Label(self.frame, textvariable=self.rx_text, style="Hex.TLabel", wraplength=505)
         rx_label.pack(fill="x", pady=(0, 6))
         rx_label.bind("<Double-Button-1>", lambda _: self.copy_rx())
         ttk.Label(self.frame, textvariable=self.state, style="Muted.TLabel", wraplength=530).pack(anchor="w")
-        for variable in (self.angle, self.angle_unit, self.speed, self.speed_unit, self.kp, self.kd):
+        for variable in (self.angle, self.angle_unit, self.speed, self.speed_unit, self.kp, self.kd, self.target_kind):
             variable.trace_add("write", lambda *_: self.update_buttons())
         self.angle_unit.trace_add("write", lambda *_: self.convert_units("angle"))
         self.speed_unit.trace_add("write", lambda *_: self.convert_units("speed"))
@@ -215,6 +222,8 @@ class MotorPanel:
     def target_matches_saved(self) -> bool:
         if self.saved_target is None:
             return False
+        if self.saved_target_kind != self.target_kind.get():
+            return False
         return all(math.isclose(a, b, rel_tol=1e-12, abs_tol=1e-12) for a, b in zip(self.values(), self.saved_target))
 
     def show_trajectory(self, trajectory: PositionTrajectory) -> None:
@@ -223,7 +232,7 @@ class MotorPanel:
         self.trajectory_info.set(
             f"{math.degrees(start):.2f}° → {math.degrees(target):.2f}° "
             f"({target:.4f} rad) · v={trajectory.velocity_rad_s:+.3f} rad/s "
-            f"({trajectory.velocity_rad_s * 60 / (2 * math.pi):+.3f} rpm) · T={trajectory.duration_s:.3f} s"
+            f"({trajectory.velocity_rad_s * 60 / (2 * math.pi):+.3f} rpm) · T={trajectory.duration_s:.3f} s lý tưởng"
         )
 
     def values(self) -> tuple[float, float, float, float]:
@@ -238,7 +247,8 @@ class MotorPanel:
             raise ValueError("Góc, tốc độ, Kp và Kd phải là số hữu hạn.")
         if self.session is None or self.settings is None:
             raise ValueError("Xác minh motor trước khi chuẩn bị lệnh.")
-        speed = self.session._validate_motion(angle + self.zero, speed, kp, kd)
+        origin = self.session.position_rad if self.target_kind.get() == "relative" else self.zero
+        speed = self.session._validate_motion(angle + origin, speed, kp, kd)
         return angle, speed, kp, kd
 
     def dispatch(self, action: str, *args) -> None:
@@ -258,23 +268,27 @@ class MotorPanel:
             return
         try:
             target = self.values()
+            self.saved_target_kind = self.target_kind.get()
             if target[1] == 0.0:
                 self.saved_target = target
                 self.trajectory_info.set("Tốc độ 0: gửi yêu cầu giảm tốc/dừng, không đi tới góc mới")
                 self.hex_text.set("Yêu cầu dừng · TX thực tế giảm tốc từ vận tốc hiện tại")
                 self.update_buttons()
                 return
-            start = self.session.motor.last_feedback.position_rad if self.session.motor.last_feedback is not None else self.zero
-            trajectory = PositionTrajectory(start, target[0] + self.zero, target[1])
+            start = self.session.position_rad if self.session.motor.last_feedback is not None else self.zero
+            endpoint = target[0] + (start if self.target_kind.get() == "relative" else self.zero)
+            trajectory = PositionTrajectory(start, endpoint, target[1])
             arbitration_id, payload = self.session.motor.encode_position_command(
-                target[0] + self.zero, 0.0 if self.settings.control_mode == 1 else abs(target[1]), target[2], target[3]
+                0.0 if self.settings.control_mode == 1 else endpoint,
+                trajectory.velocity_rad_s if self.settings.control_mode == 1 else abs(target[1]),
+                0.0 if self.settings.control_mode == 1 else target[2], target[3]
             )
         except (ValueError, RuntimeError) as exc:
             self.app.show_error(str(exc))
             return
         self.saved_target = target
         self.show_trajectory(trajectory)
-        self.hex_text.set(f"Đích CAN 0x{arbitration_id:03X} [{payload.hex(' ').upper()}] (khung cuối quỹ đạo)")
+        self.hex_text.set(f"CAN 0x{arbitration_id:03X} [{payload.hex(' ').upper()}] · góc tổng được đếm từ feedback")
         self.app.log(f"Motor 0x{self.can_id:02X}: lưu đích {target[0]:.4f} rad từ zero.")
         self.update_buttons()
 
@@ -287,7 +301,7 @@ class MotorPanel:
         except (ValueError, RuntimeError) as exc:
             self.app.show_error(str(exc))
             return
-        self.dispatch("target", *self.saved_target)
+        self.dispatch("target", *self.saved_target, self.saved_target_kind == "relative")
 
     def save_zero(self) -> None:
         self.saved_target = None
@@ -394,7 +408,7 @@ class MotorPanel:
             self.info.set(f"FW {value.firmware_version}.{value.sub_version:03d} | {mode} | PMAX ±{value.position_range_rad:g} rad | VMAX {value.velocity_range_rad_s:g} rad/s | TMAX {value.torque_range_nm:g} Nm")
             jog_limit = min(JOG_MAX_SPEED_RAD_S, value.velocity_range_rad_s)
             self.jog_limit_text.set(f"JOG −{jog_limit:g} … +{jog_limit:g} rad/s · 0 = dừng")
-            self.trajectory_info.set(f"POSITION ±{jog_limit:g} rad/s · Chiều theo góc đích · 0 = dừng")
+            self.trajectory_info.set(f"Góc tổng nhiều vòng · ±{jog_limit:g} rad/s · 0 = dừng")
         elif event == "feedback":
             self.feedback = value
             self.enabled = value.is_enabled and self.session.motor.enabled
@@ -433,7 +447,7 @@ class MotorPanel:
             self.mode_text.set("MANUAL JOG · Dừng / zero tại vị trí hiện tại" if self.control_mode == "manual" else "POSITION · Góc đích")
             self.buttons["mode"].configure(text="SANG POSITION" if self.control_mode == "manual" else "SANG MANUAL JOG")
             self.hex_text.set("TX: chế độ mới đang dừng, chờ thao tác")
-            self.trajectory_info.set("POSITION ±30 rad/s · Chiều theo góc đích · 0 = dừng")
+            self.trajectory_info.set("Góc tổng nhiều vòng · ±30 rad/s · 0 = dừng")
             self.zero_text.set(f"Zero phần mềm: {self.zero:.4f} rad")
             if self.feedback is not None:
                 self.event("feedback", self.feedback)
@@ -446,6 +460,7 @@ class MotorPanel:
             self.app.show_parameters(self.can_id, value)
         elif event == "error":
             self.enabled = False
+            self.jogging = False
             self.last_error = str(value)
             self.app.log(f"Motor 0x{self.can_id:02X} ERROR: {value}")
             self.state.set(str(value))
@@ -489,6 +504,8 @@ class MultiMotorApp:
         self.connecting = False
         self.shutting_down = False
         self.closing = False
+        self._closed_view = False
+        self._poll_timer = None
         self.events: queue.Queue = queue.Queue()
         self.panels: list[MotorPanel] = []
         self.channel = tk.StringVar(value=os.getenv("DAMIAO_CAN_CHANNEL", "COM3"))
@@ -524,7 +541,16 @@ class MultiMotorApp:
         ttk.Label(root, textvariable=self.status, padding=(22, 4), style="Page.TLabel").pack(anchor="w")
         ttk.Label(root, text="Một bus CAN · Trạng thái, zero và lệnh riêng từng motor · Disable bỏ mô-men giữ", padding=(22, 4), style="PageMuted.TLabel").pack(anchor="w")
 
-        container = ttk.Frame(root, style="Page.TFrame")
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+        self.control_tab = ttk.Frame(self.notebook, style="Page.TFrame")
+        self.graph_tab = ttk.Frame(self.notebook, style="Page.TFrame")
+        self.notebook.add(self.control_tab, text="ĐIỀU KHIỂN")
+        self.notebook.add(self.graph_tab, text="ĐỒ THỊ POS / VEL / TOR")
+        self.graphs = MotorPlots(self.graph_tab, lambda: self.notebook.select() == str(self.graph_tab))
+        self.graphs.pack(fill="both", expand=True)
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _: self.graphs.redraw() if self.notebook.select() == str(self.graph_tab) else None)
+        container = ttk.Frame(self.control_tab, style="Page.TFrame")
         container.pack(fill="both", expand=True, padx=12, pady=4)
         canvas = tk.Canvas(container, highlightthickness=0, background=BACKGROUND)
         self.motor_canvas = canvas
@@ -538,26 +564,42 @@ class MultiMotorApp:
         window = canvas.create_window((0, 0), window=self.motor_area, anchor="nw")
         self.motor_area.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda event: canvas.itemconfigure(window, width=event.width))
-        root.bind_all("<MouseWheel>", lambda event: canvas.yview_scroll(-int(event.delta / 120), "units"), add="+")
-        footer = ttk.Frame(root, style="Page.TFrame")
+        root.bind_all("<MouseWheel>", self.scroll_view, add="+")
+        footer = ttk.Frame(self.control_tab, style="Page.TFrame")
         footer.pack(fill="x", padx=22, pady=(4, 8))
         self.add_button = ttk.Button(footer, text="＋ THÊM MOTOR", command=self.add_motor)
         self.add_button.pack(side="left")
         ttk.Label(footer, text="NHẬT KÝ HOẠT ĐỘNG", style="PageMuted.TLabel").pack(side="right")
-        self.log_widget = tk.Text(root, height=3, state="disabled", font=("Consolas", 10), background=INPUT, foreground=WHITE, insertbackground=WHITE, selectbackground="#164c32", selectforeground=WHITE, relief="flat", highlightthickness=1, highlightbackground=BORDER, highlightcolor=NEON, padx=12, pady=8)
+        self.log_widget = tk.Text(self.control_tab, height=3, state="disabled", font=("Consolas", 10), background=INPUT, foreground=WHITE, insertbackground=WHITE, selectbackground="#164c32", selectforeground=WHITE, relief="flat", highlightthickness=1, highlightbackground=BORDER, highlightcolor=NEON, padx=12, pady=8)
         self.log_widget.pack(fill="x", padx=22, pady=(0, 16))
         self.add_motor()
         self.add_motor()
         self.refresh_ports()
-        self.root.bind_all("<ButtonRelease-1>", lambda _: self.release_jogs(), add="+")
-        self.root.bind("<FocusOut>", self.focus_lost, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(80, self.poll)
+        self.root.bind("<Destroy>", self._view_destroyed, add="+")
+        self.root.update_idletasks()
+        self._poll_timer = self.root.after(80, self.poll)
+
+    def _view_destroyed(self, event) -> None:
+        if event.widget is not self.root:
+            return
+        self._closed_view = True
+        if self._poll_timer is not None:
+            try:
+                self.root.after_cancel(self._poll_timer)
+            except tk.TclError:
+                pass
+            self._poll_timer = None
 
     def add_motor(self) -> None:
         if self.controller is not None or self.connecting or len(self.panels) >= 15:
             return
         self.panels.append(MotorPanel(self, self.motor_area, len(self.panels) + 1))
+        self.graphs.configure_motors([p.can_id for p in self.panels])
+
+    def scroll_view(self, event) -> None:
+        canvas = self.graphs.canvas if self.notebook.select() == str(self.graph_tab) else self.motor_canvas
+        canvas.yview_scroll(-int(event.delta / 120), "units")
 
     def refresh_ports(self) -> None:
         ports = list_ports.comports()
@@ -629,11 +671,10 @@ class MultiMotorApp:
             panel.dispatch("disable")
 
     def release_jogs(self) -> None:
-        for panel in self.panels:
-            panel.stop_jog()
+        """Mouse release is a view interaction, not a latched Jog stop."""
 
     def focus_lost(self, _event) -> None:
-        self.root.after_idle(lambda: self.release_jogs() if self.root.focus_displayof() is None else None)
+        """Focus/tab changes must not alter ongoing motor commands."""
 
     def disconnect(self) -> None:
         if self.controller is None or self.shutting_down:
@@ -670,6 +711,14 @@ class MultiMotorApp:
             tree.insert("", "end", values=(f"0x{p.address:02X}", p.name, value, p.unit))
 
     def poll(self) -> None:
+        if self._closed_view:
+            return
+        if self._poll_timer is not None:
+            try:
+                self.root.after_cancel(self._poll_timer)
+            except tk.TclError:
+                pass
+            self._poll_timer = None
         while True:
             try:
                 can_id, event, value = self.events.get_nowait()
@@ -678,6 +727,8 @@ class MultiMotorApp:
             if event == "opened":
                 self.controller = value
                 self.connecting = False
+                self.graphs.history.clear()
+                self.graphs.configure_motors(list(value.sessions))
                 for panel, session in zip(self.panels, value.sessions.values()):
                     panel.can_id = session.motor.can_id
                     panel.session = session
@@ -728,9 +779,15 @@ class MultiMotorApp:
                 panel = next((p for p in self.panels if p.can_id == can_id and p.session is not None), None)
                 if panel is not None:
                     panel.event(event, value)
+                    if event == "feedback":
+                        self.graphs.history.add(can_id, value)
+                    if event == "reference":
+                        self.graphs.history.references[can_id] = value
+                    if event in ("zero", "mode", "feedback"):
+                        self.graphs.history.zero_offsets[can_id] = panel.zero
         for panel in self.panels:
             panel.expire_feedback()
-        self.root.after(80, self.poll)
+        self._poll_timer = self.root.after(80, self.poll)
 
     def on_close(self) -> None:
         self.closing = True

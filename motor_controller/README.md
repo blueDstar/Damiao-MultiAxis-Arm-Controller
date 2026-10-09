@@ -8,7 +8,9 @@ For the two-motor GUI (CAN IDs `0x01`/`0x02`, Master IDs `0x11`/`0x12`), run fro
 python run_multi_motor.py
 ```
 
-See [multi_motor/README.md](multi_motor/README.md) for independent Enable, target, jog, software zero, feedback routing and Disable controls.
+See [multi_motor/README.md](multi_motor/README.md) for independent Enable, multi-turn position targets, click-to-run Jog, software zero and live POS/VEL/TOR plots. Switching between Control and Plots preserves input fields and ongoing motor commands.
+
+The new [robot_arm_2dof/](robot_arm_2dof/README.md) app shows a perspective 3D shoulder/elbow arm on the left and compact Position controls for CAN motors `0x01`/`0x02` on the right. It reuses the multi-motor controller and USB2CAN transport. Run `python run_robot_arm_2dof.py`, or `python run_robot_arm_2dof.py --demo` for simulated CAN without hardware. Opening either connection leaves the motors disabled; the live joint poses follow measured feedback.
 
 ## Setup
 
@@ -21,6 +23,9 @@ python -m pip install -r requirements.txt
 ```
 cd f:\Damiao_Control\motor_controller
 .\.venv\Scripts\python.exe -m single_motor.gui 
+
+cd F:\Damiao_Control\motor_controller
+python run_multi_motor.py
 
 Local connection settings are in `.env`. The starter configuration uses CAN ID `0x01`, Master ID `0x11`, CAN bitrate `1 Mbps`, and a conservative software speed cap of `0.5 rad/s`.
 

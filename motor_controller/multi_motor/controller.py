@@ -7,7 +7,7 @@ import queue
 import threading
 import time
 from concurrent.futures import Future
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from single_motor.damiao_v12 import (
@@ -16,6 +16,8 @@ from single_motor.damiao_v12 import (
 )
 from multi_motor.can_router import CANRouter, RoutedMotor
 from multi_motor.trajectory import PositionTrajectory
+from multi_motor.position_tracker import PositionTracker
+from multi_motor.velocity_loop import VelocityLoop
 
 
 JOG_MAX_SPEED_RAD_S = 30.0
@@ -57,9 +59,13 @@ class MotorSession:
         self.panel_mode = "position"
         self.pending_mode: str | None = None
         self.command_velocity = 0.0
-        self.acceleration = 1.0
+        self.position_tracker = PositionTracker()
+        self._last_motion_tick = 0.0
         self._last_poll = 0.0
         self._overspeed_samples = 0
+        self.velocity_loop = VelocityLoop()
+        self._position_stopping = False
+        self._position_direction = 0.0
         self._jobs: queue.Queue = queue.Queue()
         self._cancel = threading.Event()
         self._closed = threading.Event()
@@ -70,6 +76,18 @@ class MotorSession:
 
     def _emit(self, event: str, value: object) -> None:
         self.notify(self.motor.can_id, event, value)
+
+    @property
+    def position_rad(self) -> float:
+        if self.position_tracker.position_rad is not None:
+            return self.position_tracker.position_rad
+        return self.motor.last_feedback.position_rad if self.motor.last_feedback else 0.0
+
+    def _accept_feedback(self, feedback: MotorFeedback) -> None:
+        self.last_feedback_time = time.monotonic()
+        total = self.position_tracker.update(feedback.position_rad, feedback.velocity_rad_s,
+                                             feedback.received_at, self.motor.position_range_rad)
+        self._emit("feedback", replace(feedback, position_rad=total, raw_position_rad=feedback.position_rad))
 
     def submit(self, action: str, *args) -> Future:
         future: Future = Future()
@@ -93,14 +111,17 @@ class MotorSession:
         if abs(speed) > limit and not math.isclose(abs(speed), limit, rel_tol=1e-12, abs_tol=1e-12):
             raise ValueError(f"Speed must be within [-{limit:g}, +{limit:g}] rad/s.")
         speed = math.copysign(min(abs(speed), limit), speed)
-        if not 0 < kp <= 500 or not 0 < kd <= 5:
-            raise ValueError("Use Kp in (0, 500] and Kd in (0, 5].")
-        self.motor.encode_position_command(position, speed, kp, kd)
+        if not 0 <= kp <= 500 or not 0 < kd <= 5:
+            raise ValueError("Use Kp in [0, 500] and Kd in (0, 5].")
+        # A multi-turn target is a host coordinate, never a MIT uint16 position.
+        frame_position = 0.0 if self.motor.control_mode == CONTROL_MODE_MIT else position
+        self.motor.encode_position_command(frame_position, speed, 0.0 if self.motor.control_mode == CONTROL_MODE_MIT else kp, kd)
         return speed
 
     def _execute(self, action: str, args: tuple):
         motor = self.motor
         if action == "disable":
+            self.velocity_loop.reset()
             self.motion = None
             self.trajectory = None
             self.pending_mode = None
@@ -121,18 +142,22 @@ class MotorSession:
             if motor.enabled:
                 raise RuntimeError("Disable this motor before reading its configuration.")
             self.settings = None
+            had_position = self.position_tracker.position_rad is not None
             settings = motor.verify_configuration(cancel_event=self._cancel)
             reference_position = float(motor.read_register(0x51, cancel_event=self._cancel))
             self._poll_status(timeout_s=0.5)
             feedback = motor.last_feedback
             if feedback is None:
                 raise TimeoutError("No status feedback to validate position decoding; Enable is unavailable.")
-            if not math.isfinite(reference_position) or abs(reference_position - feedback.position_rad) > 0.05:
+            if not math.isfinite(reference_position) or not PositionTracker.equivalent(reference_position, feedback.position_rad, motor.position_range_rad):
                 raise RuntimeError(
                     f"Position decoding mismatch: XOUT={reference_position:.4f} rad, "
                     f"feedback={feedback.position_rad:.4f} rad; "
                     f"RX [{feedback.raw_payload.hex(' ').upper()}]. Enable is unavailable."
                 )
+            if not had_position:
+                self.position_tracker.seed(reference_position, feedback.position_rad, feedback.velocity_rad_s, feedback.received_at)
+                self._emit("feedback", replace(feedback, position_rad=reference_position))
             self.settings = settings
             self._emit("settings", self.settings)
             self._emit("state", "Verified / disabled")
@@ -159,7 +184,7 @@ class MotorSession:
             else:
                 self.pending_mode = mode
                 self.stable_samples = 0
-                self.motion = Motion("switch", motor.last_feedback.position_rad, self.command_velocity, 0.0, 1.0)
+                self.motion = Motion("switch", self.position_rad, 0.0, 0.0, 1.0)
                 self._emit("state", "Stopping before mode switch")
             return None
         if action == "enable":
@@ -176,15 +201,16 @@ class MotorSession:
             if self._cancel.is_set():
                 motor.disable()
                 raise ConnectionCancelledError("Enable cancelled by Disable.")
-            self.command_position = feedback.position_rad
+            self._accept_feedback(feedback)
+            self.command_position = self.position_rad
             self.last_feedback_time = time.monotonic()
             self.command_velocity = 0.0
-            self.motion = Motion("idle", feedback.position_rad, 0.0, 0.0, 0.0)
+            self.motion = Motion("idle", self.position_rad, 0.0, 0.0, 0.0)
             if not self._zero_initialized:
-                self.zero_offset = feedback.position_rad
+                self.zero_offset = self.position_rad
                 self._zero_initialized = True
                 self._emit("zero", self.zero_offset)
-            self._emit("feedback", feedback)
+            self._emit("feedback", replace(feedback, position_rad=self.position_rad))
             self._emit("state", "Enabled / idle — no position hold")
             return feedback
         if not motor.enabled or motor.last_feedback is None:
@@ -194,24 +220,28 @@ class MotorSession:
         if self.pending_mode is not None and action != "hold":
             raise RuntimeError("Wait until the motor stops and the mode switch completes.")
         if action == "zero":
-            self.zero_offset = motor.last_feedback.position_rad
+            self.zero_offset = self.position_rad
             self._zero_initialized = True
             self._emit("zero", self.zero_offset)
             return self.zero_offset
         if action == "target":
             if self.panel_mode != "position":
                 raise RuntimeError("Position commands are unavailable in Manual Jog.")
-            relative_position, speed, kp, kd = args
-            position = relative_position + self.zero_offset
+            relative_position, speed, kp, kd = args[:4]
+            rotate_from_current = bool(args[4]) if len(args) > 4 else False
+            position = relative_position + (self.position_rad if rotate_from_current else self.zero_offset)
             speed = self._validate_motion(position, speed, kp, kd)
             if speed == 0.0:
                 return self._execute("hold", ())
-            self.command_position = motor.last_feedback.position_rad
+            self.command_position = self.position_rad
             self.command_velocity = 0.0
             self.motion = Motion("target", position, abs(speed), kp, kd)
             self.trajectory = PositionTrajectory(self.command_position, position, speed)
             self.move_started = time.monotonic()
-            self.move_deadline = self.move_started + max(self.move_timeout, self.trajectory.duration_s + 2.0)
+            self._position_stopping = False
+            self._position_direction = math.copysign(1.0, position - self.position_rad)
+            self.velocity_loop.reset()
+            self.move_deadline = self.move_started + max(self.move_timeout, self.trajectory.duration_s * 2 + 5.0)
             self.stable_samples = 0
             self._overspeed_samples = 0
             self._emit("trajectory", self.trajectory)
@@ -223,29 +253,36 @@ class MotorSession:
             speed = self._validate_motion(motor.last_feedback.position_rad, speed, kp, kd, jog=True)
             if speed == 0.0:
                 return self._execute("hold", ())
-            self.command_position = motor.last_feedback.position_rad
-            self.command_velocity = 0.0
+            self.command_position = self.position_rad
+            self.command_velocity = speed
+            self.velocity_loop.reset()
+            self._last_motion_tick = time.monotonic()
+            self._overspeed_samples = 0
             self.motion = Motion("jog", self.command_position, speed, kp, kd)
             self._emit("state", "Jog +" if speed > 0 else "Jog −")
         elif action == "hold":
+            self.velocity_loop.reset()
             if self.motion is not None:
                 m = self.motion
                 self.stable_samples = 0
-                self.motion = Motion("switch" if self.pending_mode else "brake", motor.last_feedback.position_rad, self.command_velocity, 0.0, max(m.kd, 1.0))
-                self._emit("state", "Decelerating / zero position Kp")
+                self.command_velocity = 0.0
+                self.motion = Motion("switch" if self.pending_mode else "brake", self.position_rad, 0.0, 0.0, max(m.kd, 1.0))
+                self._emit("state", "Stop requested / zero velocity immediately")
         else:
             raise ValueError(f"Unknown motor action: {action}")
 
     def _finish_mode(self, mode: str, feedback: MotorFeedback) -> None:
         self.panel_mode = mode
         self.pending_mode = None
-        self.command_position = feedback.position_rad
+        self.command_position = self.position_rad
         self.command_velocity = 0.0
-        if mode == "manual":
-            self.zero_offset = feedback.position_rad
-            self._zero_initialized = True
+        # Each control-mode entry starts from the stopped physical position.
+        # Notebook view changes never call this method.
+        self.zero_offset = self.position_rad
+        self._zero_initialized = True
+        self.velocity_loop.reset()
         self.trajectory = None
-        self.motion = Motion("idle", feedback.position_rad, 0.0, 0.0, 0.0) if self.motor.enabled else None
+        self.motion = Motion("idle", self.position_rad, 0.0, 0.0, 0.0) if self.motor.enabled else None
         self._emit("mode", (mode, self.zero_offset))
         self._emit("state", "Manual Jog ready / zero at current position" if mode == "manual" else "Position ready / idle")
 
@@ -254,13 +291,7 @@ class MotorSession:
         motor._send(0x7FF, bytes((motor.can_id, 0, 0xCC, 0, 0, 0, 0, 0)))
         feedback = motor._read_feedback(timeout_s=self.interval if timeout_s is None else timeout_s)
         if feedback is not None:
-            self.last_feedback_time = time.monotonic()
-            self._emit("feedback", feedback)
-
-    def _ramp_velocity(self, requested: float) -> float:
-        difference = requested - self.command_velocity
-        self.command_velocity += math.copysign(min(abs(difference), self.acceleration * self.interval), difference)
-        return self.command_velocity
+            self._accept_feedback(feedback)
 
     def _tick(self) -> None:
         m = self.motion
@@ -283,51 +314,55 @@ class MotorSession:
                 if time.monotonic() - self.last_feedback_time > self.feedback_timeout:
                     raise TimeoutError("Motor status timed out.")
                 return
-        elif m.kind == "target":
+        elif m.kind in ("target", "hold"):
             if self.trajectory is None:
                 raise RuntimeError("Missing position trajectory.")
-            position, velocity, _ = self.trajectory.sample(time.monotonic() - self.move_started)
-            self.command_position = position
-            self.command_velocity = velocity
-            if motor.control_mode != CONTROL_MODE_MIT:
-                velocity = m.speed
-        elif m.kind in ("jog", "brake", "switch", "manual_stop"):
-            velocity = self._ramp_velocity(m.speed if m.kind == "jog" else 0.0)
-            feedback_position = motor.last_feedback.position_rad
-            limit = motor.position_range_rad
-            braking_distance = velocity * velocity / (2 * self.acceleration) + abs(velocity) * self.interval + 0.05
-            # MIT velocity jog has Kp=0; its position field does not limit travel.
-            # Only native position commands must stay inside the PMAX interval.
-            if motor.control_mode != CONTROL_MODE_MIT and ((velocity > 0 and feedback_position >= limit - braking_distance) or (velocity < 0 and feedback_position <= -limit + braking_distance)):
-                velocity = 0.0
-                self._emit("state", "Holding at position range limit")
-            if velocity == 0.0:
-                self.command_position = feedback_position
-                hold_speed = min(0.2, self.speed_cap, motor.velocity_range_rad_s)
-                if m.kind == "jog":
-                    self.motion = Motion("manual_stop", feedback_position, 0.0, 0.0, m.kd)
-                position, velocity = feedback_position, 0.0 if motor.control_mode == CONTROL_MODE_MIT else hold_speed
-            elif motor.control_mode == CONTROL_MODE_MIT:
-                position, kp = m.position, 0.0
+            error = m.position - self.position_rad
+            # Leave one position-encoding step for measurement rounding.
+            tolerance = max(0.001, 0.005 - 2 * motor.position_range_rad / 65535)
+            self.command_position = m.position
+            if motor.control_mode == CONTROL_MODE_MIT:
+                # Position is controlled by measured remaining rotation, not by
+                # chasing an elapsed-time reference that can outrun the motor.
+                position, kp = 0.0, 0.0
+                if abs(error) <= tolerance or self._position_direction * error <= 0:
+                    self._position_stopping = True
+                # Never re-enable position Kp with a wrapped/raw CAN angle: the
+                # driver's internal coordinate may be many revolutions away.
+                # Once the endpoint is reached/crossed, brake and latch Stop.
+                velocity = 0.0 if self._position_stopping or m.kind == "hold" else math.copysign(min(m.speed, abs(error) / 0.1), error)
             else:
-                self.command_position = max(-limit, min(limit, self.command_position + velocity * self.interval))
-                position, velocity = self.command_position, abs(velocity)
-        elif m.kind == "hold" and motor.control_mode == CONTROL_MODE_MIT:
-            velocity = 0.0
+                # Native Pos-Vel uses float32 positions, rather than MIT uint16.
+                position, velocity = m.position, m.speed
+            self.command_velocity = velocity if motor.control_mode == CONTROL_MODE_MIT else math.copysign(m.speed, error)
+        elif m.kind in ("jog", "brake", "switch", "manual_stop"):
+            velocity = m.speed if m.kind == "jog" else 0.0
+            self.command_velocity = velocity
+            if motor.control_mode == CONTROL_MODE_MIT:
+                position, kp = 0.0, 0.0
+            else:
+                if m.kind == "jog":
+                    tick_time = time.monotonic()
+                    self.command_position += velocity * max(0.0, tick_time - self._last_motion_tick)
+                    self._last_motion_tick = tick_time
+                else:
+                    self.command_position = self.position_rad
+                position, velocity = self.command_position, max(abs(velocity), min(0.2, motor.velocity_range_rad_s))
+        reference_velocity = velocity if motor.control_mode == CONTROL_MODE_MIT else self.command_velocity
+        if motor.control_mode == CONTROL_MODE_MIT:
+            velocity = self.velocity_loop.command(reference_velocity, motor.last_feedback.velocity_rad_s,
+                                                   motor.last_feedback.received_at, motor.velocity_range_rad_s)
+        self._emit("reference", (m.position if m.kind in ("target", "hold") else None, reference_velocity, velocity))
         arbitration_id, payload = motor.encode_position_command(position, velocity, kp, m.kd)
         if m.kind == "target":
             if time.monotonic() - self.last_feedback_time > self.feedback_timeout:
                 raise TimeoutError("Position motion requires fresh feedback; no further setpoint sent.")
-            tracking_limit = max(0.15, m.speed * max(0.05, 2 * self.interval))
-            if abs(position - motor.last_feedback.position_rad) > tracking_limit:
-                raise RuntimeError(f"Position tracking error exceeds {tracking_limit:g} rad; motion stopped.")
         motor._send(arbitration_id, payload)
         self._emit("tx", (arbitration_id, payload))
         feedback = motor._read_feedback(timeout_s=self.interval)
         now = time.monotonic()
         if feedback is not None:
-            self.last_feedback_time = now
-            self._emit("feedback", feedback)
+            self._accept_feedback(feedback)
             if not feedback.is_enabled:
                 raise RuntimeError(f"Driver reported {feedback.status_text} (status 0x{feedback.status_code:X}); command stream stopped.")
             if m.kind in ("target", "jog"):
@@ -336,21 +371,23 @@ class MotorSession:
                 if self._overspeed_samples >= 3:
                     raise RuntimeError("Measured speed exceeds requested motion speed; motion stopped.")
             if m.kind in ("brake", "switch"):
-                stopped = self.command_velocity == 0.0 and abs(feedback.velocity_rad_s) <= max(0.03, 4 * motor.velocity_range_rad_s / 4095)
+                stopped = (motor.control_mode != CONTROL_MODE_MIT or self.command_velocity == 0.0) and abs(feedback.velocity_rad_s) <= max(0.03, 4 * motor.velocity_range_rad_s / 4095)
                 self.stable_samples = self.stable_samples + 1 if stopped else 0
                 if self.stable_samples >= 3:
                     if self.pending_mode is not None:
                         self._finish_mode(self.pending_mode, feedback)
                     else:
-                        self.motion = Motion("manual_stop", feedback.position_rad, 0.0, 0.0, max(m.kd, 1.0))
+                        self.motion = Motion("manual_stop", self.position_rad, 0.0, 0.0, max(m.kd, 1.0))
                         self._emit("state", "Stopped / zero velocity / no position recoil")
             if m.kind == "target":
-                finished = self.trajectory is not None and now - self.move_started >= self.trajectory.duration_s
-                settled = finished and abs(m.position - feedback.position_rad) <= 0.005 and abs(feedback.velocity_rad_s) <= max(0.03, 4 * motor.velocity_range_rad_s / 4095)
+                if motor.control_mode == CONTROL_MODE_MIT:
+                    settled = self._position_stopping and abs(feedback.velocity_rad_s) <= max(0.03, 4 * motor.velocity_range_rad_s / 4095)
+                else:
+                    settled = abs(m.position - self.position_rad) <= 0.005 and abs(feedback.velocity_rad_s) <= max(0.03, 4 * motor.velocity_range_rad_s / 4095)
                 self.stable_samples = self.stable_samples + 1 if settled else 0
                 if self.stable_samples >= 3:
                     self.motion = Motion("hold", m.position, m.speed, m.kp, m.kd)
-                    self._emit("state", "Target reached / holding")
+                    self._emit("state", f"Position stopped; measured angle error {self.position_rad - m.position:+.4f} rad")
         if now - self.last_feedback_time > self.feedback_timeout:
             raise TimeoutError("Motor feedback timed out; Disable requested.")
         if m.kind == "target" and self.motion.kind == "target" and now > self.move_deadline:

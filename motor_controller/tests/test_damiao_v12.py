@@ -452,7 +452,7 @@ class DamiaoV12Tests(unittest.TestCase):
         self.assertEqual(len(disable_frames), 1)
 
     def test_rejects_target_outside_driver_range_before_enable(self) -> None:
-        bus = FakeBus()
+        bus = FakeBus(control_mode=1)
         motor = DamiaoV12(bus, can_id=0x01, master_id=0x11)
         motor.verify_configuration()
 

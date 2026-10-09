@@ -43,9 +43,14 @@ class SharedFakeBus:
         self.fail_rx = False
         self.lock = threading.Lock()
         self.last_command_time = {}
+        self.feedback_period = {1: 25.0, 2: 25.0}
+
+    def wire_position(self, can_id):
+        period = self.feedback_period[can_id]
+        return (self.positions[can_id] + period / 2) % period - period / 2
 
     def feedback(self, can_id):
-        raw = round((self.positions[can_id] + 12.5) * 65535 / 25.0)
+        raw = round((self.wire_position(can_id) + 12.5) * 65535 / 25.0)
         velocity_raw = round((self.velocities[can_id] + 30) * 4095 / 60)
         status = self.faults[can_id] or int(self.enabled[can_id])
         payload = bytes((can_id | status << 4,)) + raw.to_bytes(2, "big", signed=False) + bytes((velocity_raw >> 4, ((velocity_raw & 15) << 4) | 8, 0, 25, 30))
@@ -87,7 +92,7 @@ class SharedFakeBus:
                     if self.enabled[can_id] and (kp or kd):
                         self.velocities[can_id] = velocity if abs(velocity) > 60 / 4095 else 0.0
                     if self.enabled[can_id] and kp:
-                        self.positions[can_id] = raw * 25 / 65535 - 12.5
+                        self.positions[can_id] += (raw * 25 / 65535 - 12.5) - self.wire_position(can_id)
                     elif self.enabled[can_id] and kd:
                         self.positions[can_id] += self.velocities[can_id] * delta
                 self.rx.put(self.feedback(can_id))
@@ -328,7 +333,7 @@ class ControllerTests(unittest.TestCase):
         self.assertAlmostEqual(self.two.zero_offset, -0.8, places=3)
         self.one.submit("target", 0.1, 0.5, 2, 1).result(2)
         self.two.submit("target", -0.9, 0.5, 2, 1).result(2)
-        wait_for(lambda: self.one.motion.kind == "hold" and self.two.motion.kind == "hold")
+        wait_for(lambda: self.one.motion.kind == "hold" and self.two.motion.kind == "hold", timeout=3)
         self.assertAlmostEqual(self.bus.positions[1], zero + 0.1, delta=0.05)
         self.assertAlmostEqual(self.bus.positions[2], self.two.zero_offset - 0.9, delta=0.005)
 
@@ -357,7 +362,7 @@ class ControllerTests(unittest.TestCase):
     def test_invalid_target_does_not_replace_other_commands(self):
         self.enable_both()
         original = self.one.motion
-        for target in ((13, 0.2, 2, 1), (0, 31, 2, 1), (0, 0.2, 0, 1), (math.nan, 0.2, 2, 1)):
+        for target in ((math.inf, 0.2, 2, 1), (0, 31, 2, 1), (0, 0.2, -1, 1), (math.nan, 0.2, 2, 1)):
             with self.subTest(target=target), self.assertRaises(ValueError):
                 self.one.submit("target", *target).result(2)
         self.assertIs(self.one.motion, original)
@@ -564,6 +569,8 @@ class GUITests(unittest.TestCase):
         two.start_jog(-1)
         wait_for(lambda: two.session.motion.kind == "jog")
         self.app.release_jogs()
+        self.assertEqual(two.session.motion.kind, "jog")
+        two.stop_motion()
         wait_for(lambda: two.session.motion.kind == "manual_stop")
         one.dispatch("disable")
         wait_for(lambda: not one.session.motor.enabled)

@@ -106,6 +106,7 @@ class MotorFeedback:
     motor_temperature_c: int
     raw_payload: bytes = b""
     received_at: float = field(default_factory=time.monotonic)
+    raw_position_rad: float | None = None
 
     @property
     def status_code(self) -> int:
@@ -330,7 +331,7 @@ class DamiaoMotor:
         """Return the CAN arbitration ID and eight-byte position command."""
         if not all(math.isfinite(value) for value in (position_rad, velocity_rad_s, kp, kd)):
             raise ValueError("Position, velocity, Kp, and Kd must be finite numbers.")
-        if abs(position_rad) > self.position_range_rad:
+        if self.control_mode == CONTROL_MODE_MIT and abs(position_rad) > self.position_range_rad:
             raise ValueError(
                 f"Target angle exceeds the driver's PMAX range ±{self.position_range_rad:g} rad."
             )
