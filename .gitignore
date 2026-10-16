@@ -24,6 +24,8 @@ dist/
 wheelhouse/
 
 # Logs and local runtime data
+/motor_controller/motor_feedback/
+/motor_controller/robot_arm_2dof/local_config.json
 *.log
 logs/
 
